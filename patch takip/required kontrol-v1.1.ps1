@@ -572,18 +572,27 @@ function Import-RequiredUpdates {
 }
 
 # Listelenen güncellemelerin hangi SUG'lara üye olduğunu okur (SMS_CIRelation, RelationType=1).
+# Performans: SUG başına ayrı bir WMI sorgusu atmak yerine (N+1 sorgu problemi;
+# ortamda SUG sayısı kadar ayrı round-trip demektir), TÜM RelationType=1
+# ilişkileri TEK sorguda çekip bellekte SUG ID'lerine göre filtreliyoruz.
+# Böylece kaç SUG olursa olsun tek bir WMI çağrısı yeterli oluyor.
 function Import-Memberships {
     $script:Members = @{}
     foreach ($k in @($script:Updates.Keys)) {
         $script:Members[$k] = New-Object 'System.Collections.Generic.HashSet[string]'
     }
-    foreach ($g in $script:Groups) {
-        if ($g.Id -notmatch '^\d+$') { continue }
-        $rows = Invoke-CMWql "SELECT ToCIID FROM SMS_CIRelation WHERE FromCIID = $($g.Id) AND RelationType = 1"
-        foreach ($r in $rows) {
-            $to = [string]$r.ToCIID
-            if ($script:Members.ContainsKey($to)) { [void]$script:Members[$to].Add($g.Id) }
-        }
+    if ($script:Groups.Count -eq 0) { return }
+
+    $groupIds = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($g in $script:Groups) { if ($g.Id -match '^\d+$') { [void]$groupIds.Add($g.Id) } }
+    if ($groupIds.Count -eq 0) { return }
+
+    $rows = Invoke-CMWql 'SELECT FromCIID, ToCIID FROM SMS_CIRelation WHERE RelationType = 1'
+    foreach ($r in $rows) {
+        $from = [string]$r.FromCIID
+        if (-not $groupIds.Contains($from)) { continue }   # SUG'a ait olmayan ilişkileri ele
+        $to = [string]$r.ToCIID
+        if ($script:Members.ContainsKey($to)) { [void]$script:Members[$to].Add($from) }
     }
 }
 
