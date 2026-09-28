@@ -39,6 +39,8 @@
       - Dosya kontrolu         : Get-Item -Path \\Bilgisayar\C$\Klasor\dosya.txt
       - Registry kontrolu      : reg.exe query \\Bilgisayar\HKLM\...  (sadece HKLM/HKU)
       - Registry value okuma   : reg.exe query \\Bilgisayar\HKLM\... /v DegerAdi
+      - Online kontrolu        : Ping + Get-Item \\Bilgisayar\C$ (ikisi de basarili olmali;
+                                 ping var ama C$ okunamiyorsa makine kapali / VPN IP'si sayilir)
 
     Hedef makinelerde: kontrolu yapan kullanici admin olmali, Admin$ paylasimi
     acik olmali (dosya kontrolu icin), Remote Registry servisi calisiyor olmali
@@ -54,6 +56,7 @@ $script:LastResults           = @()    # Son kontrol sonuclari (ServiceDetail da
 $script:FixLog                = @()    # Duzeltme sonrasi degisiklik kayitlari (rapor icin)
 $script:SuppressHistorySelect = $false
 $script:HistoryItems          = @()
+$script:PendingText           = 'Bekleniyor...'   # Tabloda henuz sonucu gelmemis makine satirlari
 
 # ==================== YARDIMCI FONKSIYONLAR ====================
 # NOT: Asagidaki fonksiyonlar hem ana pencere tarafindan, hem de paralel
@@ -133,13 +136,28 @@ function Get-RemoteStatus {
         ErrorMessage    = ''
     }
 
-    $online = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction SilentlyContinue
-    $row.IsOnline = [bool]$online
-
-    if (-not $online) {
+    # ---- Cevrimici kontrolu (2 asamali) ----
+    # 1) Ping yoksa makine zaten offline.
+    # 2) Ping VAR ama \\host\c$ okunamiyorsa makine gercekte kapali kabul edilir
+    #    (ping VPN / yanlis IP uzerinden donuyor olabilir) -> offline.
+    $ping = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction SilentlyContinue
+    if (-not $ping) {
+        $row.IsOnline = $false
         $row.ErrorMessage = 'Makine yanit vermiyor (ping basarisiz)'
         return $row
     }
+
+    try {
+        $null = Get-Item -Path "\\$ComputerName\c`$" -ErrorAction Stop
+    }
+    catch {
+        $detail = ($_.Exception.Message -replace '\s+', ' ').Trim()
+        $row.IsOnline = $false
+        $row.ErrorMessage = "Ping donuyor ancak \\$ComputerName\c`$ erisilemiyor (makine kapali veya VPN/yanlis IP olabilir): $detail"
+        return $row
+    }
+
+    $row.IsOnline = $true
 
     # ---- Servis durumu: Get-Service -ComputerName (RPC/SCM), tek tek kontrol
     #      edilir ki hangi servisin bulunamadigi (NotFound) ayirt edilebilsin ----
@@ -901,7 +919,10 @@ $dgv.add_CellFormatting({
     if (-not $rowView) { return }
     $isOnline   = "$($rowView['IsOnline'])"
     $notRunning = $rowView['NotRunning']
-    if ($isOnline -eq 'False') {
+    if ("$($rowView['ErrorMessage'])" -eq $script:PendingText) {
+        $e.CellStyle.BackColor = [System.Drawing.Color]::LightGray
+    }
+    elseif ($isOnline -eq 'False') {
         $e.CellStyle.BackColor = [System.Drawing.Color]::LightCoral
     }
     elseif ($notRunning) {
@@ -1080,6 +1101,12 @@ $btnCheck.Add_Click({
     $script:CheckTotal = @($computers).Count
     $script:CheckDone  = 0
 
+    # Tum makineler bastan tabloya "Bekleniyor..." olarak eklenir; sonuc geldikce
+    # ilgili satir guncellenir. Boylece hangi makinelerin kaldigi gorulur.
+    foreach ($c in $computers) {
+        $null = $script:ResultsTable.Rows.Add($c, $c, '', '', '', '', '', '', $script:PendingText)
+    }
+
     # Havuz kapasitesi SABIT 10: ayni anda en fazla 10 makineye istek gider.
     $script:CheckPool = [runspacefactory]::CreateRunspacePool(1, 10)
     $script:CheckPool.Open()
@@ -1114,20 +1141,53 @@ $script:CheckTimer.Add_Tick({
         if ($job.Async.IsCompleted) {
             $job.Done = $true
             $r = $null
-            try { $r = $job.PS.EndInvoke($job.Async) } catch { $r = $null }
+            $errText = ''
+            try {
+                $r = $job.PS.EndInvoke($job.Async)
+                if ($job.PS.Streams.Error.Count -gt 0) { $errText = "$($job.PS.Streams.Error[0])" }
+            }
+            catch { $r = $null; $errText = $_.Exception.Message }
             $job.PS.Dispose()
+
+            # Bu makinenin "Bekleniyor..." satirini bul.
+            $pendingRow = $null
+            foreach ($tr in $script:ResultsTable.Rows) {
+                if ($tr['ComputerName'] -eq $job.Computer -and $tr['ErrorMessage'] -eq $script:PendingText) {
+                    $pendingRow = $tr
+                    break
+                }
+            }
 
             if ($r) {
                 $script:LastResults += $r
-                $null = $script:ResultsTable.Rows.Add(
+                [object[]]$vals = @(
                     $r.ComputerName, $r.Hostname, $r.Running, $r.NotRunning,
                     $r.LastShutdown, $r.IsOnline, $r.FilePathControl,
                     $r.RegistryValue, $r.ErrorMessage
                 )
+                if ($pendingRow) { $pendingRow.ItemArray = $vals }
+                else { $null = $script:ResultsTable.Rows.Add($vals) }
+            }
+            else {
+                # Islem sonuc dondurmediyse makine sessizce kaybolmasin.
+                $msg = 'Sonuc alinamadi'
+                if ($errText) { $msg += ": $errText" }
+                if ($pendingRow) {
+                    $pendingRow['IsOnline']     = 'False'
+                    $pendingRow['ErrorMessage'] = $msg
+                }
+                else {
+                    $null = $script:ResultsTable.Rows.Add($job.Computer, $job.Computer, '', '', '', 'False', 'N/A', 'N/A', $msg)
+                }
             }
 
             $script:CheckDone++
-            $lblStatus.Text = "$($script:CheckDone) / $($script:CheckTotal) makine tamamlandi (ayni anda en fazla 10 istek)"
+            $remaining = @($script:CheckJobs | Where-Object { -not $_.Done } | ForEach-Object { $_.Computer })
+            $statusText = "$($script:CheckDone) / $($script:CheckTotal) makine tamamlandi (ayni anda en fazla 10 istek)"
+            if ($remaining.Count -gt 0 -and $remaining.Count -le 5) {
+                $statusText += "  |  Kalan: " + ($remaining -join ', ')
+            }
+            $lblStatus.Text = $statusText
         }
         else {
             $stillRunning = $true
