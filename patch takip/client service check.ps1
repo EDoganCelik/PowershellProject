@@ -179,7 +179,8 @@ function Get-RemoteStatus {
     # ---- Son kapanma zamani: Get-WinEvent -ComputerName (RPC / Event Log) ----
     try {
         $evt = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{ LogName = 'System'; Id = 1074, 6006, 6008 } -MaxEvents 1 -ErrorAction Stop
-        $row.LastShutdown = $evt.TimeCreated
+        # Kultur bagimsiz, sabit bicim: gun/ay/yil saat:dakika
+        $row.LastShutdown = $evt.TimeCreated.ToString('dd/MM/yyyy HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
     }
     catch {
         $row.LastShutdown = 'N/A'
@@ -289,6 +290,30 @@ function Get-HostSummary {
     return (($parts -join ', ') + '.')
 }
 
+function ConvertTo-ShutdownDateTime {
+    # Verilen degeri [datetime]'a cevirir; cevrilemezse (ornegin 'N/A') $null doner.
+    # Once sabit bicim (dd/MM/yyyy HH:mm) denenir; farkli bir bicimde gelen deger
+    # icin sirasiyla mevcut kultur ve invariant kultur denenir.
+    param($Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) { return $Value }
+
+    $text = "$Value".Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+
+    $inv    = [System.Globalization.CultureInfo]::InvariantCulture
+    $styles = [System.Globalization.DateTimeStyles]::None
+    $dt     = [datetime]::MinValue
+
+    [string[]]$exact = @('dd/MM/yyyy HH:mm', 'dd/MM/yyyy HH:mm:ss')
+    if ([datetime]::TryParseExact($text, $exact, $inv, $styles, [ref]$dt)) { return $dt }
+    if ([datetime]::TryParse($text, [System.Globalization.CultureInfo]::CurrentCulture, $styles, [ref]$dt)) { return $dt }
+    if ([datetime]::TryParse($text, $inv, $styles, [ref]$dt)) { return $dt }
+
+    return $null
+}
+
 function Export-ToExcelAndOpen {
     # Verilen pscustomobject dizisini gercek bir .xlsx dosyasina yazar ve
     # (Excel COM Automation ile) dosyayi kullanicinin ekraninda otomatik acar.
@@ -331,8 +356,28 @@ function Export-ToExcelAndOpen {
         $r = 2
         foreach ($item in $Data) {
             for ($c = 0; $c -lt $props.Count; $c++) {
-                $val = $item.($props[$c])
-                $ws.Cells.Item($r, $c + 1) = [string]$val
+                $prop = $props[$c]
+                $val  = $item.$prop
+
+                if ($prop -eq 'LastShutdown') {
+                    # Tarih sutunu: her deger dd/MM/yyyy HH:mm bicimine getirilir ve
+                    # Excel'e GERCEK tarih olarak yazilir. NumberFormat'taki "\/"
+                    # ayirac karakterinin bolge ayarina gore "." olmasini engeller.
+                    $cell = $ws.Cells.Item($r, $c + 1)
+                    $dt   = ConvertTo-ShutdownDateTime -Value $val
+                    if ($null -ne $dt) {
+                        $cell.NumberFormat = 'dd\/mm\/yyyy\ hh:mm'
+                        $cell.Value2 = $dt.ToOADate()
+                    }
+                    else {
+                        # Tarihe cevrilemeyen deger (ornegin N/A) metin olarak kalir.
+                        $cell.NumberFormat = '@'
+                        $cell.Value2 = [string]$val
+                    }
+                }
+                else {
+                    $ws.Cells.Item($r, $c + 1) = [string]$val
+                }
             }
             $r++
         }
