@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     SCCM'de superseded (yerini daha yeni bir güncellemeye bırakmış) güncellemeleri listeler,
     Software Update Group (SUG) üyeliklerini düzenler ve istenirse Deployment Package içeriğinden siler (UI ile).
