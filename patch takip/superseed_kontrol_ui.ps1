@@ -12,6 +12,12 @@
     - "Kaynak" seçimi ile state.json'da olmayan, ortamda daha önce (bu araç kullanılmadan) oluşturulmuş
       Deployment Package'lar ve Software Update Group'lar da taranabilir:
           State kaydı / Ortamdaki bir Package / Ortamdaki bir SUG / Ortamdaki TÜM Package'lar + TÜM SUG'lar
+    - "Ortamdaki TÜM Superseded + Deploy edilmiş güncellemeler" kaynağı: state.json'a veya tek tek Package/SUG
+      gezmeye gerek kalmadan, ortamdaki tüm superseded (istenirse Expired) güncellemeleri TEK sorguyla okur ve
+      yalnızca deploy edilmiş bir SUG'a (SMS_UpdateGroupAssignment) üye olanları listeler.
+    - "Ortamdaki TÜM Deployment Package'larda indirilmiş + Superseded güncellemeler" kaynağı: ortamdaki tüm superseded
+      güncellemeleri tek sorguyla okur ve içeriği herhangi bir Software Update Deployment Package'a indirilmiş
+      (SMS_PackageToContent) olanları, bulundukları Package ID'leriyle listeler. "Seçilileri Package'tan Sil" bu modda da kullanılabilir.
     - Sağ tarafta ortamdaki TÜM Software Update Group'lar listelenir (SCCM'deki "Edit Membership" penceresi gibi).
       Seçili güncellemeler için kutular şöyle çalışır:
           işaretli   : seçili güncellemelerin hepsi grubun üyesi (işaretlerseniz eksikler EKLENİR)
@@ -19,6 +25,9 @@
           dolu kare  : bir kısmı üye; bu durumda değişiklik yapılmaz
     - "Seçilileri Package'tan Sil": seçili güncellemelerin içeriğini state'teki Deployment Package'tan siler
       (SMS_SoftwareUpdatesPackage.RemoveContent). Başka bir güncelleme ile paylaşılan içerik silinmez.
+      Silme sonrası sonuç SMS_PackageToContent'ten DOĞRULANIR; içerik hâlâ package'taysa başarılı sayılmaz.
+    - Sağdaki "Deployment Package'lar" sekmesinde işaretlenen (Hariç) package'lar silme işleminden MUAF tutulur:
+      bir güncelleme 5 package'ta ise ve 1'i işaretliyse, içerik yalnızca diğer 4'ünden silinir.
     - "Simülasyon" kutusu işaretliyken hiçbir değişiklik yapılmaz, sadece ne yapılacağı günlüğe yazılır.
 
 .NOTES
@@ -47,6 +56,9 @@ $script:Members      = @{}      # güncelleme CI_ID (string) -> HashSet[string] 
 $script:OrigCheck    = @{}      # SUG CI_ID (string) -> kutunun ilk hesaplanan durumu
 $script:Suspend      = $false   # UI olaylarını geçici olarak susturmak için
 $script:EnvPackages  = @()      # ortamdaki tüm Software Update Deployment Package'lar (Id, Name)
+$script:DeployedIds  = @{}      # deploy edilmiş SUG (ve varsa doğrudan güncelleme) CI_ID'leri (string -> $true)
+$script:ExcludedPkgs = @{}      # silmeden HARİÇ tutulacak PackageID'ler (string -> bool)
+$script:PkgNames     = @{}      # PackageID (string) -> package adı
 
 # ------------------------------------------------------------------
 # state.json okuma (SADECE okuma)
@@ -259,6 +271,34 @@ function Add-UiTextColumn {
     [void]$Grid.Columns.Add($c)
 }
 
+# Çift tıklayınca sütunu içeriğine göre genişletir, tekrar çift tıklayınca eski genişliğe döndürür.
+# (Başlığa veya herhangi bir hücreye çift tıklanabilir.)
+function Enable-ColumnDoubleClickExpand {
+    param($Grid)
+    $toggle = {
+        param($sender, $e)
+        if ($e.ColumnIndex -lt 0) { return }
+        $col = $sender.Columns[$e.ColumnIndex]
+        if ($col.Tag -is [hashtable] -and $col.Tag.Expanded) {
+            $col.Width = [int]$col.Tag.Orig
+            $col.Tag = $null
+        } else {
+            $orig = $col.Width
+            $sender.AutoResizeColumn($e.ColumnIndex, [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::AllCells)
+            $col.Tag = @{ Orig = $orig; Expanded = $true }
+            # Genişleyen sütun kısmen ekran dışında kaldıysa görünür alana kaydır
+            try {
+                $rect = $sender.GetColumnDisplayRectangle($e.ColumnIndex, $false)
+                if ($rect.Width -lt $col.Width -and $col.Frozen -eq $false) {
+                    $sender.FirstDisplayedScrollingColumnIndex = $e.ColumnIndex
+                }
+            } catch { }
+        }
+    }
+    $Grid.Add_ColumnHeaderMouseDoubleClick($toggle)
+    $Grid.Add_CellDoubleClick($toggle)
+}
+
 # ------------------------------------------------------------------
 # Form
 # ------------------------------------------------------------------
@@ -310,6 +350,8 @@ $cmbSource.Size = New-Object System.Drawing.Size(330, 24)
 [void]$cmbSource.Items.Add('Ortamdaki bir Deployment Package')
 [void]$cmbSource.Items.Add('Ortamdaki bir Software Update Group')
 [void]$cmbSource.Items.Add('Ortamdaki TÜM Package''lar + TÜM SUG''lar')
+[void]$cmbSource.Items.Add('Ortamdaki TÜM Superseded + Deploy edilmiş güncellemeler')
+[void]$cmbSource.Items.Add('Ortamdaki TÜM Package''larda indirilmiş + Superseded güncellemeler')
 $cmbSource.SelectedIndex = 0
 $gTop.Controls.Add($cmbSource)
 [void](New-UiLabel $gTop 'Yapı:' 430 96 40)
@@ -325,17 +367,21 @@ $btnEnv.Anchor = 'Top,Right'
 
 # --- Superseded güncellemeler ---
 $gUpd = New-UiGroup $form 'Superseded güncellemeler (seçili kapsam)' 10 140 800 500
-$gUpd.Anchor = 'Top,Bottom,Left'
+$gUpd.Anchor = 'Top,Bottom,Left,Right'
 $gridUpd = New-UiGrid $gUpd 10 22 780 430
 $gridUpd.MultiSelect = $true
 $gridUpd.ReadOnly = $true
+$gridUpd.AutoSizeColumnsMode = 'None'          # Fill kapalı: sütunlar sabit genişlikte, toplam sığmazsa X scroll çıkar
+$gridUpd.ScrollBars = 'Both'
+$gridUpd.AllowUserToResizeColumns = $true
 Add-UiTextColumn $gridUpd 'uKB' 'KB' 80
-Add-UiTextColumn $gridUpd 'uTitle' 'Başlık' 160 $true 55
-Add-UiTextColumn $gridUpd 'uPosted' 'Yayın' 80
-Add-UiTextColumn $gridUpd 'uStatus' 'Durum' 100
+Add-UiTextColumn $gridUpd 'uTitle' 'Başlık' 360
+Add-UiTextColumn $gridUpd 'uPosted' 'Yayın' 85
+Add-UiTextColumn $gridUpd 'uStatus' 'Durum' 150
 Add-UiTextColumn $gridUpd 'uPkg' 'Package' 85
-Add-UiTextColumn $gridUpd 'uGroups' 'Üye olduğu SUG''lar' 140 $true 45
+Add-UiTextColumn $gridUpd 'uGroups' 'Üye olduğu SUG''lar' 260
 Add-UiTextColumn $gridUpd 'uId' 'CI_ID' 75
+Enable-ColumnDoubleClickExpand $gridUpd
 
 $btnSelAll = New-UiButton $gUpd 'Tümünü Seç' 10 462 100 26
 $btnSelAll.Anchor = 'Bottom,Left'
@@ -344,13 +390,26 @@ $btnSelNone.Anchor = 'Bottom,Left'
 $lblCount = New-UiLabel $gUpd '' 235 466 545
 $lblCount.Anchor = 'Bottom,Left'
 
-# --- Tüm SUG'lar ---
-$gGrp = New-UiGroup $form 'Software Update Grupları (ortamdaki tümü)' 820 140 450 500
-$gGrp.Anchor = 'Top,Bottom,Left,Right'
-[void](New-UiLabel $gGrp 'Grup ara:' 10 26 60)
-$txtFilter = New-UiTextBox $gGrp 72 23 368
+# --- Sağ panel: SUG'lar ve Deployment Package'lar (sekmeli) ---
+$gGrp = New-UiGroup $form 'Gruplar ve Package''lar (ortamdaki tümü)' 820 140 450 500
+$gGrp.Anchor = 'Top,Bottom,Right'   # sabit genişlik (450), pencere büyüyünce sağa kayar
+$tabRight = New-Object System.Windows.Forms.TabControl
+$tabRight.Location = New-Object System.Drawing.Point(6, 18)
+$tabRight.Size = New-Object System.Drawing.Size(438, 476)
+$tabRight.Anchor = 'Top,Bottom,Left,Right'
+$gGrp.Controls.Add($tabRight)
+$tabSug = New-Object System.Windows.Forms.TabPage
+$tabSug.Text = 'Software Update Grupları'
+$tabPkg = New-Object System.Windows.Forms.TabPage
+$tabPkg.Text = 'Deployment Package''lar (silmeden hariç tut)'
+[void]$tabRight.TabPages.Add($tabSug)
+[void]$tabRight.TabPages.Add($tabPkg)
+
+# -- Sekme 1: SUG'lar --
+[void](New-UiLabel $tabSug 'Grup ara:' 6 10 60)
+$txtFilter = New-UiTextBox $tabSug 70 7 356
 $txtFilter.Anchor = 'Top,Left,Right'
-$gridGrp = New-UiGrid $gGrp 10 52 430 400
+$gridGrp = New-UiGrid $tabSug 6 36 424 360
 $gridGrp.MultiSelect = $false
 $colChk = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
 $colChk.Name = 'gChk'
@@ -362,9 +421,29 @@ Add-UiTextColumn $gridGrp 'gName' 'Grup adı' 150 $true 100
 Add-UiTextColumn $gridGrp 'gSel' 'Seçili' 55
 Add-UiTextColumn $gridGrp 'gTotal' 'Toplam' 60
 Add-UiTextColumn $gridGrp 'gState' ([string][char]0x2605) 30
-$lblLegend = New-UiLabel $gGrp ('İşaretli: ekle  |  Boş: çıkar  |  Dolu kare: dokunma.  ' + [char]0x2605 + ' = state.json''daki SUG. Güncelleme seçimi değişirse kutular yeniden hesaplanır.') 10 458 430 36
+$lblLegend = New-UiLabel $tabSug ('İşaretli: ekle  |  Boş: çıkar  |  Dolu kare: dokunma.  ' + [char]0x2605 + ' = state.json''daki SUG. Güncelleme seçimi değişirse kutular yeniden hesaplanır.') 6 400 424 40
 $lblLegend.Anchor = 'Bottom,Left,Right'
 $lblLegend.ForeColor = [System.Drawing.Color]::DimGray
+
+# -- Sekme 2: Deployment Package'lar (silmeden hariç tut) --
+[void](New-UiLabel $tabPkg 'Package ara:' 6 10 72)
+$txtPkgFilter = New-UiTextBox $tabPkg 82 7 344
+$txtPkgFilter.Anchor = 'Top,Left,Right'
+$gridPkg = New-UiGrid $tabPkg 6 36 424 330
+$gridPkg.MultiSelect = $false
+$colPkgChk = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+$colPkgChk.Name = 'pChk'
+$colPkgChk.HeaderText = 'Hariç'
+$colPkgChk.Width = 45
+$colPkgChk.ThreeState = $false
+[void]$gridPkg.Columns.Add($colPkgChk)
+Add-UiTextColumn $gridPkg 'pName' 'Package adı' 140 $true 100
+Add-UiTextColumn $gridPkg 'pId' 'Package ID' 80
+Add-UiTextColumn $gridPkg 'pSel' 'Seçili' 50
+Add-UiTextColumn $gridPkg 'pTotal' 'Listede' 55
+$lblPkgLegend = New-UiLabel $tabPkg ('İşaretli (Hariç): içerik bu package''ta KALIR, "Seçilileri Package''tan Sil" işleminde atlanır.  Boş: seçili güncellemelerin içeriği bu package''tan silinir.  ' + 'Seçili = seçili güncellemelerden kaçı bu package''ta, Listede = listelenen güncellemelerden kaçı bu package''ta.') 6 370 424 70
+$lblPkgLegend.Anchor = 'Bottom,Left,Right'
+$lblPkgLegend.ForeColor = [System.Drawing.Color]::DimGray
 
 # --- İşlemler ---
 $gAct = New-UiGroup $form 'İşlemler' 10 646 1260 62
@@ -508,6 +587,15 @@ function Get-SelectedScope {
             foreach ($pk in $script:EnvPackages) { $all += New-ScopeEntry -PkgId $pk.Id -PkgName $pk.Name }
             foreach ($gr in $script:Groups)      { $all += New-ScopeEntry -SugId $gr.Id -SugName $gr.Name }
             return @($all)
+        }
+        4 {
+            # Ortamdaki tüm superseded + deploy edilmiş güncellemeler: Package/SUG kapsamı gerekmez
+            # (Invoke-List bu modu tek sorguyla kendisi çözer).
+            return @()
+        }
+        5 {
+            # Ortamdaki tüm Package'larda indirilmiş + superseded güncellemeler: kapsam gerekmez (tek sorguyla çözülür).
+            return @()
         }
         default {
             $idx = $cmbState.SelectedIndex
@@ -653,6 +741,64 @@ function Import-Memberships {
     }
 }
 
+# Listelenen (superseded) güncellemelerin içeriğinin hangi Software Update Deployment Package'larda
+# bulunduğunu TEK çift sorguyla okur ve $script:Updates[..].PkgIds alanını doldurur.
+#   1) SMS_PackageToContent  : superseded güncellemelerin içeriklerinin bulunduğu Package'lar
+#   2) SMS_CIToContent       : güncelleme (CI_ID) -> ContentID eşlemesi
+# Yalnızca Software Update Deployment Package'lar (SMS_SoftwareUpdatesPackage) dikkate alınır.
+function Import-UpdatePackages {
+    param([string]$Filter)
+    $pkgSet = @{}
+    foreach ($r in (Invoke-CMWql 'SELECT PackageID FROM SMS_SoftwareUpdatesPackage')) { $pkgSet[[string]$r.PackageID] = $true }
+
+    $pkgByContent = @{}
+    $rows = Invoke-CMWql "SELECT pc.* FROM SMS_PackageToContent AS pc JOIN SMS_CIToContent AS cc ON pc.ContentID = cc.ContentID JOIN SMS_SoftwareUpdate AS su ON su.CI_ID = cc.CI_ID WHERE $Filter"
+    foreach ($r in $rows) {
+        $pk = [string]$r.PackageID
+        if (-not $pkgSet.ContainsKey($pk)) { continue }
+        $ct = [string]$r.ContentID
+        if (-not $pkgByContent.ContainsKey($ct)) { $pkgByContent[$ct] = New-Object 'System.Collections.Generic.HashSet[string]' }
+        [void]$pkgByContent[$ct].Add($pk)
+    }
+
+    $rows = Invoke-CMWql "SELECT cc.* FROM SMS_CIToContent AS cc JOIN SMS_SoftwareUpdate AS su ON su.CI_ID = cc.CI_ID WHERE $Filter"
+    foreach ($r in $rows) {
+        $ci = [string]$r.CI_ID
+        $ct = [string]$r.ContentID
+        if (-not $script:Updates.ContainsKey($ci)) { continue }
+        if (-not $pkgByContent.ContainsKey($ct)) { continue }
+        $rec = $script:Updates[$ci]
+        foreach ($pk in $pkgByContent[$ct]) {
+            if (-not $rec.PkgIds.Contains($pk)) { $rec.PkgIds.Add($pk) }
+        }
+    }
+}
+
+# Deploy edilmiş (SMS_UpdateGroupAssignment) SUG'ların CI_ID'lerini TEK sorguda okur.
+# AssignedCIs: deployment'ın hedeflediği CI_ID'ler (SUG deployment'ında SUG'ın CI_ID'si).
+function Get-DeployedCIIds {
+    $ids = @{}
+    $rows = Invoke-CMWql 'SELECT * FROM SMS_UpdateGroupAssignment'
+    foreach ($r in $rows) {
+        foreach ($ci in @($r.AssignedCIs)) {
+            if ($null -ne $ci -and "$ci" -match '^\d+$') { $ids[[string]$ci] = $true }
+        }
+    }
+    return $ids
+}
+
+# Güncelleme deploy edilmiş bir SUG'a üyeyse (ya da doğrudan deploy edilmişse) $true döner.
+function Test-UpdateDeployed {
+    param([string]$UpdateId)
+    if ($script:DeployedIds.ContainsKey($UpdateId)) { return $true }
+    if ($script:Members.ContainsKey($UpdateId)) {
+        foreach ($gid in $script:Members[$UpdateId]) {
+            if ($script:DeployedIds.ContainsKey($gid)) { return $true }
+        }
+    }
+    return $false
+}
+
 function Get-MemberNames {
     param([string]$UpdateId)
     if (-not $script:Members.ContainsKey($UpdateId)) { return '' }
@@ -707,6 +853,7 @@ function Show-Updates {
             $parts = @()
             if ($u.Superseded) { $parts += 'Superseded' }
             if ($u.Expired)    { $parts += 'Expired' }
+            if ($script:DeployedIds.Count -gt 0 -and (Test-UpdateDeployed $u.Id)) { $parts += 'Deployed' }
             $row.Cells['uKB'].Value = $u.KB
             $row.Cells['uTitle'].Value = $u.Title
             $row.Cells['uPosted'].Value = $u.Posted
@@ -732,6 +879,76 @@ function Get-SelectedUpdateIds {
     $ids = @()
     foreach ($row in $gridUpd.SelectedRows) { $ids += [string]$row.Tag }
     return $ids
+}
+
+# Ortamdaki Software Update Deployment Package adlarını TEK sorguda okur.
+function Import-PackageNames {
+    $script:PkgNames = @{}
+    foreach ($r in (Invoke-CMWql 'SELECT PackageID, Name FROM SMS_SoftwareUpdatesPackage')) {
+        $script:PkgNames[[string]$r.PackageID] = [string]$r.Name
+    }
+}
+
+# Listelenen güncellemelerin bulunduğu Deployment Package'ları sağdaki "Package'lar" sekmesine doldurur.
+# "Hariç" işaretleri ($script:ExcludedPkgs) yeniden listelemede korunur.
+function Show-Packages {
+    $count = @{}
+    foreach ($u in $script:Updates.Values) {
+        foreach ($pk in $u.PkgIds) {
+            if ($count.ContainsKey($pk)) { $count[$pk]++ } else { $count[$pk] = 1 }
+        }
+    }
+    if ($count.Count -gt 0) {
+        try { Import-PackageNames } catch { Write-Log "Package adları okunamadı: $($_.Exception.Message)" 'WARN' }
+    }
+    $prev = $script:Suspend
+    $script:Suspend = $true
+    try {
+        $gridPkg.CurrentCell = $null
+        $gridPkg.Rows.Clear()
+        $keys = @($count.Keys | Sort-Object { if ($script:PkgNames.ContainsKey($_)) { $script:PkgNames[$_] } else { $_ } })
+        foreach ($pkgKey in $keys) {
+            $i = $gridPkg.Rows.Add()
+            $row = $gridPkg.Rows[$i]
+            $row.Tag = $pkgKey
+            $isEx = ($script:ExcludedPkgs.ContainsKey($pkgKey) -and $script:ExcludedPkgs[$pkgKey])
+            $nm = ''
+            if ($script:PkgNames.ContainsKey($pkgKey)) { $nm = $script:PkgNames[$pkgKey] }
+            $row.Cells['pChk'].Value = [bool]$isEx
+            $row.Cells['pName'].Value = $nm
+            $row.Cells['pId'].Value = $pkgKey
+            $row.Cells['pSel'].Value = ''
+            $row.Cells['pTotal'].Value = $count[$pkgKey]
+            if ($isEx) { $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::LightGreen }
+        }
+    } finally {
+        $script:Suspend = $prev
+    }
+    Update-PackageCounts
+}
+
+# Seçili güncellemelerden kaçının her package'ta bulunduğunu ("Seçili" kolonu) günceller.
+function Update-PackageCounts {
+    $sel = @(Get-SelectedUpdateIds)
+    $n = $sel.Count
+    foreach ($row in $gridPkg.Rows) {
+        $pkgKey = [string]$row.Tag
+        $m = 0
+        foreach ($uid in $sel) {
+            if ($script:Updates.ContainsKey($uid) -and $script:Updates[$uid].PkgIds.Contains($pkgKey)) { $m++ }
+        }
+        if ($n -gt 0) { $row.Cells['pSel'].Value = "$m/$n" } else { $row.Cells['pSel'].Value = '' }
+    }
+}
+
+function Set-PackageFilter {
+    $t = $txtPkgFilter.Text.Trim()
+    $gridPkg.CurrentCell = $null
+    foreach ($row in $gridPkg.Rows) {
+        $hay = ([string]$row.Cells['pName'].Value) + ' ' + ([string]$row.Cells['pId'].Value)
+        $visible = (-not $t) -or ($hay.IndexOf($t, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+        if ($row.Visible -ne $visible) { $row.Visible = $visible }
+    }
 }
 
 # Seçili güncellemelere göre SUG kutularını (tam / boş / kısmi) yeniden hesaplar.
@@ -784,7 +1001,7 @@ function Invoke-List {
         $mode = $cmbSource.SelectedIndex
         if ($mode -eq 3) { Import-Environment }
         $scope = @(Get-SelectedScope)
-        if ($scope.Count -eq 0) {
+        if ($scope.Count -eq 0 -and $mode -ne 4 -and $mode -ne 5) {
             if ($mode -eq 0) { Show-Message 'Kullanılabilir bir state kaydı yok. Önce state.json dosyasını yükleyin.' 'Uyarı' 'Warning' }
             else             { Show-Message "Önce 'Ortamı Oku' düğmesiyle ortamdaki yapıları yükleyin ve listeden birini seçin." 'Uyarı' 'Warning' }
             return
@@ -800,33 +1017,76 @@ function Invoke-List {
         if ($chkExpired.Checked) { $flt = '(su.IsSuperseded = 1 OR su.IsExpired = 1)' }
         else                     { $flt = 'su.IsSuperseded = 1' }
 
-        $pkgIds = @($scope | ForEach-Object { $_.PkgId } | Where-Object { $_ } | Select-Object -Unique)
-        $sugIds = @($scope | ForEach-Object { $_.SugId } | Where-Object { $_ } | Select-Object -Unique)
+        $script:DeployedIds = @{}
 
-        foreach ($pkg in $pkgIds) {
-            if ($pkg -notmatch '^[A-Za-z0-9]+$') { Write-Log "Geçersiz PackageID atlandı: '$pkg'" 'WARN'; continue }
-            Write-Log "Package içeriği taranıyor: $pkg"
-            $q = "SELECT su.* FROM SMS_SoftwareUpdate AS su JOIN SMS_CIToContent AS cc ON su.CI_ID = cc.CI_ID JOIN SMS_PackageToContent AS pc ON pc.ContentID = cc.ContentID WHERE pc.PackageID = '$pkg' AND $flt"
-            $rows = Invoke-CMWql $q
-            foreach ($r in $rows) { Add-UpdateRecord -Row $r -PkgId $pkg }
-            Write-Log "  $($pkg): $($rows.Count) satır (aynı güncellemenin birden fazla içeriği tekrar sayılabilir)."
-        }
-
-        foreach ($sug in $sugIds) {
-            if ($sug -notmatch '^\d+$') { Write-Log "Geçersiz SUG CI_ID atlandı: '$sug'" 'WARN'; continue }
-            $gname = $sug
-            if ($script:GroupById.ContainsKey($sug)) { $gname = $script:GroupById[$sug].Name }
-            Write-Log "State SUG üyeleri taranıyor: $gname ($sug)"
-            $q = "SELECT su.* FROM SMS_SoftwareUpdate AS su JOIN SMS_CIRelation AS cr ON su.CI_ID = cr.ToCIID WHERE cr.FromCIID = $sug AND cr.RelationType = 1 AND $flt"
-            $rows = Invoke-CMWql $q
+        # Ortamdaki TÜM superseded güncellemeler (mod 4 ve 5): Package/SUG gezmeden TEK sorgu.
+        # Mod 4: deploy filtresi, üyelikler okunduktan sonra aşağıda bellekte uygulanır.
+        # Mod 5: Package filtresi burada uygulanır (içeriği hiçbir Deployment Package'ta olmayanlar elenir).
+        if ($mode -eq 4 -or $mode -eq 5) {
+            Write-Log 'Ortamdaki superseded güncellemeler tek sorguyla okunuyor...'
+            $rows = Invoke-CMWql "SELECT * FROM SMS_SoftwareUpdate AS su WHERE $flt"
             foreach ($r in $rows) { Add-UpdateRecord -Row $r -PkgId $null }
-            Write-Log "  $gname : $($rows.Count) güncelleme."
+            Write-Log "$($script:Updates.Count) superseded güncelleme okundu."
+
+            if ($mode -eq 5) {
+                Write-Log 'Deployment Package içerikleri eşleştiriliyor (indirilmiş olanlar aranıyor)...'
+                Import-UpdatePackages -Filter $flt
+                $before = $script:Updates.Count
+                foreach ($k in @($script:Updates.Keys)) {
+                    if ($script:Updates[$k].PkgIds.Count -eq 0) { $script:Updates.Remove($k) }
+                }
+                Write-Log "Package filtresi: $($script:Updates.Count) güncelleme kaldı ($($before - $script:Updates.Count) hiçbir Package'ta indirilmemiş elendi)."
+            }
+        }
+        else {
+            $pkgIds = @($scope | ForEach-Object { $_.PkgId } | Where-Object { $_ } | Select-Object -Unique)
+            $sugIds = @($scope | ForEach-Object { $_.SugId } | Where-Object { $_ } | Select-Object -Unique)
+
+            foreach ($pkg in $pkgIds) {
+                if ($pkg -notmatch '^[A-Za-z0-9]+$') { Write-Log "Geçersiz PackageID atlandı: '$pkg'" 'WARN'; continue }
+                Write-Log "Package içeriği taranıyor: $pkg"
+                $q = "SELECT su.* FROM SMS_SoftwareUpdate AS su JOIN SMS_CIToContent AS cc ON su.CI_ID = cc.CI_ID JOIN SMS_PackageToContent AS pc ON pc.ContentID = cc.ContentID WHERE pc.PackageID = '$pkg' AND $flt"
+                $rows = Invoke-CMWql $q
+                foreach ($r in $rows) { Add-UpdateRecord -Row $r -PkgId $pkg }
+                Write-Log "  $($pkg): $($rows.Count) satır (aynı güncellemenin birden fazla içeriği tekrar sayılabilir)."
+            }
+
+            foreach ($sug in $sugIds) {
+                if ($sug -notmatch '^\d+$') { Write-Log "Geçersiz SUG CI_ID atlandı: '$sug'" 'WARN'; continue }
+                $gname = $sug
+                if ($script:GroupById.ContainsKey($sug)) { $gname = $script:GroupById[$sug].Name }
+                Write-Log "State SUG üyeleri taranıyor: $gname ($sug)"
+                $q = "SELECT su.* FROM SMS_SoftwareUpdate AS su JOIN SMS_CIRelation AS cr ON su.CI_ID = cr.ToCIID WHERE cr.FromCIID = $sug AND cr.RelationType = 1 AND $flt"
+                $rows = Invoke-CMWql $q
+                foreach ($r in $rows) { Add-UpdateRecord -Row $r -PkgId $null }
+                Write-Log "  $gname : $($rows.Count) güncelleme."
+            }
         }
 
         Write-Log 'SUG üyelikleri okunuyor...'
         Import-Memberships
+
+        if ($mode -eq 4) {
+            Write-Log 'Deploy edilmiş SUG''lar okunuyor (SMS_UpdateGroupAssignment)...'
+            $script:DeployedIds = Get-DeployedCIIds
+            Write-Log "$($script:DeployedIds.Count) deploy hedefi (SUG) bulundu."
+            if ($script:DeployedIds.Count -eq 0) {
+                Write-Log 'Hiç deployment bulunamadı; liste boş olacak. Yetkinizi ve SMS_UpdateGroupAssignment erişimini kontrol edin.' 'WARN'
+            }
+            $before = $script:Updates.Count
+            foreach ($k in @($script:Updates.Keys)) {
+                if (-not (Test-UpdateDeployed $k)) {
+                    $script:Updates.Remove($k)
+                    $script:Members.Remove($k)
+                }
+            }
+            Write-Log "Deploy filtresi: $($script:Updates.Count) güncelleme kaldı ($($before - $script:Updates.Count) deploy edilmemiş elendi)."
+        }
+
         Show-Updates
+        Show-Packages
         Set-GroupFilter
+        Set-PackageFilter
         Write-Log "Listeleme tamamlandı: $($script:Updates.Count) benzersiz güncelleme." 'OK'
     }
     catch {
@@ -913,9 +1173,145 @@ function Invoke-ApplyMembership {
     }
 }
 
+# ------------------------------------------------------------------
+# Package içeriği silme yardımcıları
+# ------------------------------------------------------------------
+# Package'ın (SMS_PackageToContent) ŞU AN içerdiği ContentID'leri döndürür (gerçek durum kaynağı).
+function Get-PackageContentIdSet {
+    param([string]$PkgId)
+    $h = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($r in (Invoke-CMWql "SELECT ContentID FROM SMS_PackageToContent WHERE PackageID = '$PkgId'")) {
+        [void]$h.Add([string]$r.ContentID)
+    }
+    return ,$h
+}
+
+# RemoveContent'i, parametre adlarını WMI'den okuyarak (adlara/sıraya güvenmeden) çağırır.
+function Invoke-PkgRemoveContent {
+    param($Pkg, [uint32[]]$Ids)
+    $in = $Pkg.GetMethodParameters('RemoveContent')
+    $arrProp = $null
+    $boolProp = $null
+    $desc = @()
+    foreach ($pr in $in.Properties) {
+        $desc += ('{0}:{1}{2}' -f $pr.Name, $pr.Type, $(if ($pr.IsArray) { '[]' } else { '' }))
+        if ($pr.IsArray -and -not $arrProp) { $arrProp = $pr.Name }
+        elseif ((-not $pr.IsArray) -and ($pr.Type -eq [System.Management.CimType]::Boolean) -and -not $boolProp) { $boolProp = $pr.Name }
+    }
+    Write-Log ("RemoveContent parametreleri: " + ($desc -join ', ')) 'INFO'
+    if (-not $arrProp) { throw 'RemoveContent için ID dizisi parametresi bulunamadı.' }
+    $in.Properties[$arrProp].Value = $Ids
+    if ($boolProp) { $in.Properties[$boolProp].Value = $true }
+    $out = $Pkg.InvokeMethod('RemoveContent', $in, $null)
+    $rv = $null
+    if ($out) { foreach ($pr in $out.Properties) { if ($pr.Name -eq 'ReturnValue') { $rv = $pr.Value } } }
+    if ($null -ne $rv -and [int]$rv -ne 0) { throw "RemoveContent başarısız (dönüş kodu: $rv)." }
+    return $rv
+}
+
+# Verilen ContentID'ler package'tan kalkana kadar bekler (en fazla ~Tries*DelaySec sn). Geriye KALAN sayısını döner.
+function Wait-ContentRemoved {
+    param([string]$PkgId, [uint32[]]$ContentIds, [int]$Tries = 6, [int]$DelaySec = 2)
+    $left = 0
+    for ($i = 1; $i -le $Tries; $i++) {
+        $cur = Get-PackageContentIdSet $PkgId
+        $left = @($ContentIds | Where-Object { $cur.Contains([string]$_) }).Count
+        if ($left -eq 0) { return 0 }
+        if ($i -lt $Tries) {
+            Start-Sleep -Seconds $DelaySec
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    }
+    return $left
+}
+
+# İçeriği siler ve SONUCU DOĞRULAR. Önce ContentID ile dener; içerik hâlâ duruyorsa ve güvenliyse
+# güncellemelerin CI_ID'leri ile tekrar dener (RemoveContent'in ID türü sürüme göre farklı yorumlanabilir).
+# ID çakışması (bir ContentID'nin başka bir güncellemenin CI_ID'si ile aynı sayı olması) durumunda
+# yanlış içeriğin silinmemesi için ilgili ID'ler atlanır.
+function Remove-PackageContentVerified {
+    param($Pkg, [string]$PkgId, [uint32[]]$ContentIds, [string[]]$CiIds, [object[]]$Pairs)
+
+    $selSet = @{}
+    foreach ($s in $CiIds) { $selSet[[string]$s] = $true }
+    $ciAll = New-Object 'System.Collections.Generic.HashSet[string]'
+    $contentsByCi = @{}
+    foreach ($pr in $Pairs) {
+        $ciKey = [string]$pr.CI_ID
+        $ctKey = [string]$pr.ContentID
+        [void]$ciAll.Add($ciKey)
+        if (-not $contentsByCi.ContainsKey($ciKey)) { $contentsByCi[$ciKey] = New-Object 'System.Collections.Generic.List[string]' }
+        $contentsByCi[$ciKey].Add($ctKey)
+    }
+    $removeSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($c in $ContentIds) { [void]$removeSet.Add([string]$c) }
+
+    $method = '-'
+
+    # --- 1. deneme: ContentID ile ---
+    $targets = @()
+    $skipped = 0
+    foreach ($c in $ContentIds) {
+        $cs = [string]$c
+        if ($ciAll.Contains($cs) -and -not $selSet.ContainsKey($cs)) { $skipped++; continue }
+        $targets += [uint32]$c
+    }
+    if ($skipped -gt 0) {
+        Write-Log "[$PkgId] $skipped içerik ID'si başka bir güncellemenin CI_ID'si ile çakıştığı için güvenlik amacıyla atlandı." 'WARN'
+    }
+    $left = $targets.Count
+    if ($targets.Count -gt 0) {
+        $rv = Invoke-PkgRemoveContent -Pkg $Pkg -Ids ([uint32[]]$targets)
+        Write-Log "[$PkgId] RemoveContent (ContentID ile, $($targets.Count) içerik) çağrıldı. Dönüş: [$rv]. Sonuç doğrulanıyor..."
+        $left = Wait-ContentRemoved -PkgId $PkgId -ContentIds ([uint32[]]$targets)
+        if ($left -eq 0) { $method = 'ContentID' }
+    }
+
+    # --- 2. deneme: CI_ID ile (yalnızca 1. deneme etkisiz kaldıysa) ---
+    if ($targets.Count -gt 0 -and $left -gt 0) {
+        Write-Log "[$PkgId] ContentID ile çağrı hata vermedi ama $left içerik hâlâ package'ta. CI_ID ile deneniyor..." 'WARN'
+        $inPkg = Get-PackageContentIdSet $PkgId
+        $cand = @()
+        $candContents = @()
+        foreach ($ciKey in $CiIds) {
+            if (-not $contentsByCi.ContainsKey($ciKey)) { continue }
+            $mine = $true
+            $still = $false
+            foreach ($ctKey in $contentsByCi[$ciKey]) {
+                if (-not $removeSet.Contains($ctKey)) { $mine = $false }
+                if ($inPkg.Contains($ctKey)) { $still = $true }
+            }
+            if (-not $mine -or -not $still) { continue }     # paylaşılan içerik / zaten silinmiş
+            if ($inPkg.Contains($ciKey)) {
+                Write-Log "[$PkgId] CI_ID $ciKey, package'taki bir ContentID ile çakıştığı için atlandı." 'WARN'
+                continue
+            }
+            $cand += [uint32]$ciKey
+            foreach ($ctKey in $contentsByCi[$ciKey]) { $candContents += [uint32]$ctKey }
+        }
+        if ($cand.Count -gt 0) {
+            $rv = Invoke-PkgRemoveContent -Pkg $Pkg -Ids ([uint32[]]$cand)
+            Write-Log "[$PkgId] RemoveContent (CI_ID ile, $($cand.Count) güncelleme) çağrıldı. Dönüş: [$rv]. Sonuç doğrulanıyor..."
+            [void](Wait-ContentRemoved -PkgId $PkgId -ContentIds ([uint32[]]@($candContents | Select-Object -Unique)))
+            $method = 'CI_ID'
+        } else {
+            Write-Log "[$PkgId] CI_ID ile denenebilecek güvenli aday bulunamadı." 'WARN'
+        }
+    }
+
+    # --- Nihai durum: package'ta gerçekte ne kaldı? ---
+    $cur = Get-PackageContentIdSet $PkgId
+    $remaining = @($ContentIds | Where-Object { $cur.Contains([string]$_) }).Count
+    return [pscustomobject]@{ Total = $ContentIds.Count; Remaining = $remaining; Method = $method }
+}
+
 function Invoke-RemoveFromPackage {
     $sel = @(Get-SelectedUpdateIds)
     if ($sel.Count -eq 0) { Show-Message 'Önce soldaki listeden en az bir güncelleme seçin.' 'Uyarı' 'Warning'; return }
+
+    # "Hariç" işaretli package'lar: değer = bu package'tan silinmeyecek seçili güncelleme sayısı
+    $excl = @{}
+    foreach ($k in @($script:ExcludedPkgs.Keys)) { if ($script:ExcludedPkgs[$k]) { $excl[[string]$k] = 0 } }
 
     $byPkg = @{}
     $stillInSug = 0
@@ -923,14 +1319,23 @@ function Invoke-RemoveFromPackage {
     foreach ($id in $sel) {
         $u = $script:Updates[$id]
         if (-not $u -or $u.PkgIds.Count -eq 0) { $noPkg++; continue }
+        $added = $false
         foreach ($p in $u.PkgIds) {
+            if ($excl.ContainsKey($p)) { $excl[$p]++; continue }
             if (-not $byPkg.ContainsKey($p)) { $byPkg[$p] = New-Object 'System.Collections.Generic.List[string]' }
             $byPkg[$p].Add($id)
+            $added = $true
         }
-        if ($script:Members.ContainsKey($id) -and $script:Members[$id].Count -gt 0) { $stillInSug++ }
+        if ($added -and $script:Members.ContainsKey($id) -and $script:Members[$id].Count -gt 0) { $stillInSug++ }
     }
+    $exTotal = 0
+    foreach ($k in @($excl.Keys)) { $exTotal += $excl[$k] }
     if ($byPkg.Count -eq 0) {
-        Show-Message "Seçili güncellemelerin hiçbiri state'teki Deployment Package içinde değil (yalnızca SUG üyesi)." 'Uyarı' 'Warning'
+        if ($exTotal -gt 0) {
+            Show-Message "Seçili güncellemelerin bulunduğu tüm package'lar 'Hariç' olarak işaretli; silinecek bir şey yok." 'Bilgi' 'Information'
+        } else {
+            Show-Message "Seçili güncellemelerin hiçbiri state'teki Deployment Package içinde değil (yalnızca SUG üyesi)." 'Uyarı' 'Warning'
+        }
         return
     }
 
@@ -941,6 +1346,17 @@ function Invoke-RemoveFromPackage {
     if ($simulate) { $msg += "SİMÜLASYON - hiçbir değişiklik yapılmayacak.`n`n" }
     $msg += "Aşağıdaki Deployment Package'lardan seçili güncellemelerin İÇERİĞİ silinecek:`n`n" + ($lines -join "`n")
     if ($noPkg -gt 0) { $msg += "`n`n$noPkg seçili güncelleme package içinde olmadığı için atlanacak." }
+    if ($exTotal -gt 0) {
+        $exLines = @()
+        foreach ($k in @($excl.Keys)) {
+            if ($excl[$k] -gt 0) {
+                $nm = $k
+                if ($script:PkgNames.ContainsKey($k)) { $nm = "$k ($($script:PkgNames[$k]))" }
+                $exLines += ('- {0}: {1} güncelleme' -f $nm, $excl[$k])
+            }
+        }
+        $msg += "`n`nHARİÇ TUTULANLAR (bu package'lardan SİLİNMEYECEK):`n" + ($exLines -join "`n")
+    }
     if ($stillInSug -gt 0) {
         $msg += "`n`nUYARI: $stillInSug güncelleme hâlâ en az bir SUG'a üye. Önce SUG üyeliklerinden çıkarmanız önerilir."
     }
@@ -953,6 +1369,7 @@ function Invoke-RemoveFromPackage {
 
     Set-Busy $true
     $changed = $false
+    $failedPkgs = 0
     try {
         foreach ($pkgId in @($byPkg.Keys)) {
             if ($pkgId -notmatch '^[A-Za-z0-9]+$') { Write-Log "Geçersiz PackageID atlandı: '$pkgId'" 'WARN'; continue }
@@ -977,17 +1394,21 @@ function Invoke-RemoveFromPackage {
             $pkg = Get-WmiObject -ComputerName (Get-Connection).Server -Namespace "root\SMS\site_$((Get-Connection).Site)" `
                 -Class SMS_SoftwareUpdatesPackage -Filter "PackageID='$pkgId'" -ErrorAction Stop
             if (-not $pkg) { throw "Deployment Package bulunamadı: $pkgId" }
+            if ($pkg -is [array]) { $pkg = $pkg[0] }
 
-            Write-Log "[$pkgId] $($set.Remove.Count) içerik siliniyor (RemoveContent)..."
-            $res = $pkg.RemoveContent($set.Remove, $true)
-            if ($res -and $null -ne $res.ReturnValue -and [int]$res.ReturnValue -ne 0) {
-                throw "RemoveContent başarısız (dönüş kodu: $($res.ReturnValue))."
+            Write-Log "[$pkgId] $($set.Remove.Count) içerik siliniyor..."
+            $res = Remove-PackageContentVerified -Pkg $pkg -PkgId $pkgId -ContentIds $set.Remove -CiIds $ids -Pairs $pairs
+            if (($res.Total - $res.Remaining) -gt 0) { $changed = $true }
+            if ($res.Remaining -eq 0) {
+                Write-Log "[$pkgId] $($res.Total) içerik package'tan silindi ve DOĞRULANDI (yöntem: $($res.Method))." 'OK'
+            } else {
+                $failedPkgs++
+                Write-Log "[$pkgId] $($res.Remaining)/$($res.Total) içerik HÂLÂ package'ta duruyor. Dağıtım Yöneticisi işlemi sürdürüyor olabilir; birkaç dakika sonra 'Listele' ile tekrar kontrol edin. Kalıyorsa SMS Provider sunucusunda smsprov.log ve site sunucusunda distmgr.log kayıtlarına bakın." 'ERROR'
             }
-            $changed = $true
-            Write-Log "[$pkgId] $($ids.Count) güncellemenin içeriği package'tan silindi." 'OK'
         }
         if ($simulate) { Show-Message 'Simülasyon tamamlandı. Ayrıntılar günlükte.' }
-        else           { Show-Message "Silme işlemi tamamlandı. Liste yenileniyor." }
+        elseif ($failedPkgs -gt 0) { Show-Message "$failedPkgs package'ta içerik silinemedi (hâlâ duruyor). Ayrıntılar günlükte." 'Uyarı' 'Warning' }
+        else { Show-Message "Silme işlemi tamamlandı ve doğrulandı. Liste yenileniyor." }
     }
     catch {
         Write-Log $_.Exception.Message 'ERROR'
@@ -1028,6 +1449,8 @@ $cmbState.Add_SelectedIndexChanged({
 
 $cmbSource.Add_SelectedIndexChanged({
     $cmbState.Enabled = ($cmbSource.SelectedIndex -eq 0)
+    $cmbEnv.Enabled = ($cmbSource.SelectedIndex -eq 1 -or $cmbSource.SelectedIndex -eq 2)
+    $btnEnv.Enabled = ($cmbSource.SelectedIndex -eq 1 -or $cmbSource.SelectedIndex -eq 2 -or $cmbSource.SelectedIndex -eq 3)
     Update-EnvCombo
 })
 $btnEnv.Add_Click({
@@ -1051,8 +1474,28 @@ $btnEnv.Add_Click({
 $txtFilter.Add_TextChanged({ Set-GroupFilter })
 
 $gridUpd.Add_SelectionChanged({
-    if (-not $script:Suspend) { Update-GroupChecks }
+    if (-not $script:Suspend) { Update-GroupChecks; Update-PackageCounts }
 })
+
+$txtPkgFilter.Add_TextChanged({ Set-PackageFilter })
+
+# Package "Hariç" kutusu: tıklama anında işlensin ve işaret $script:ExcludedPkgs içinde saklansın
+$gridPkg.Add_CurrentCellDirtyStateChanged({
+    if ($gridPkg.IsCurrentCellDirty) {
+        [void]$gridPkg.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit)
+    }
+})
+$gridPkg.Add_CellValueChanged({
+    param($sender, $e)
+    if ($script:Suspend -or $e.RowIndex -lt 0 -or $e.ColumnIndex -ne 0) { return }
+    $row = $gridPkg.Rows[$e.RowIndex]
+    $pkgKey = [string]$row.Tag
+    $isEx = ($row.Cells['pChk'].Value -eq $true)
+    $script:ExcludedPkgs[$pkgKey] = $isEx
+    if ($isEx) { $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::LightGreen }
+    else       { $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::Empty }
+})
+$gridPkg.Add_DataError({ param($sender, $e) $e.ThrowException = $false })
 
 # 3 durumlu kutuda tıklamanın hemen işlenmesi için
 $gridGrp.Add_CurrentCellDirtyStateChanged({

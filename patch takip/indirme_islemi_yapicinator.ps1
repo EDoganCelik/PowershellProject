@@ -237,6 +237,34 @@ function Add-UiTextColumn {
     [void]$Grid.Columns.Add($c)
 }
 
+# Çift tıklayınca sütunu içeriğine göre genişletir, tekrar çift tıklayınca eski genişliğe döndürür.
+# (Başlığa veya herhangi bir hücreye çift tıklanabilir.)
+function Enable-ColumnDoubleClickExpand {
+    param($Grid)
+    $toggle = {
+        param($sender, $e)
+        if ($e.ColumnIndex -lt 0) { return }
+        $col = $sender.Columns[$e.ColumnIndex]
+        if ($col.Tag -is [hashtable] -and $col.Tag.Expanded) {
+            $col.Width = [int]$col.Tag.Orig
+            $col.Tag = $null
+        } else {
+            $orig = $col.Width
+            $sender.AutoResizeColumn($e.ColumnIndex, [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::AllCells)
+            $col.Tag = @{ Orig = $orig; Expanded = $true }
+            # Genişleyen sütun kısmen ekran dışında kaldıysa görünür alana kaydır
+            try {
+                $rect = $sender.GetColumnDisplayRectangle($e.ColumnIndex, $false)
+                if ($rect.Width -lt $col.Width -and $col.Frozen -eq $false) {
+                    $sender.FirstDisplayedScrollingColumnIndex = $e.ColumnIndex
+                }
+            } catch { }
+        }
+    }
+    $Grid.Add_ColumnHeaderMouseDoubleClick($toggle)
+    $Grid.Add_CellDoubleClick($toggle)
+}
+
 # ------------------------------------------------------------------
 # Form
 # ------------------------------------------------------------------
@@ -287,17 +315,21 @@ $btnList.Anchor = 'Top,Right'
 
 # --- Required güncellemeler ---
 $gUpd = New-UiGroup $form 'Required güncellemeler (filtreye uyan)' 10 140 800 500
-$gUpd.Anchor = 'Top,Bottom,Left'
+$gUpd.Anchor = 'Top,Bottom,Left,Right'
 $gridUpd = New-UiGrid $gUpd 10 22 780 430
 $gridUpd.MultiSelect = $true
 $gridUpd.ReadOnly = $true
+$gridUpd.AutoSizeColumnsMode = 'None'          # Fill kapalı: sütunlar sabit genişlikte, toplam sığmazsa X scroll çıkar
+$gridUpd.ScrollBars = 'Both'
+$gridUpd.AllowUserToResizeColumns = $true
 Add-UiTextColumn $gridUpd 'uKB' 'KB' 80
-Add-UiTextColumn $gridUpd 'uTitle' 'Başlık' 160 $true 55
-Add-UiTextColumn $gridUpd 'uReq' 'Required' 65
-Add-UiTextColumn $gridUpd 'uPosted' 'Yayın' 80
-Add-UiTextColumn $gridUpd 'uCat' 'Kategori' 110 $true 25
-Add-UiTextColumn $gridUpd 'uGroups' 'Üye olduğu SUG''lar' 120 $true 30
+Add-UiTextColumn $gridUpd 'uTitle' 'Başlık' 360
+Add-UiTextColumn $gridUpd 'uReq' 'Required' 70
+Add-UiTextColumn $gridUpd 'uPosted' 'Yayın' 85
+Add-UiTextColumn $gridUpd 'uCat' 'Kategori' 150
+Add-UiTextColumn $gridUpd 'uGroups' 'Üye olduğu SUG''lar' 260
 Add-UiTextColumn $gridUpd 'uId' 'CI_ID' 75
+Enable-ColumnDoubleClickExpand $gridUpd
 
 $btnSelAll = New-UiButton $gUpd 'Tümünü Seç' 10 462 100 26
 $btnSelAll.Anchor = 'Bottom,Left'
@@ -308,7 +340,7 @@ $lblCount.Anchor = 'Bottom,Left'
 
 # --- Tüm SUG'lar ---
 $gGrp = New-UiGroup $form 'Software Update Grupları (ortamdaki tümü)' 820 140 450 500
-$gGrp.Anchor = 'Top,Bottom,Left,Right'
+$gGrp.Anchor = 'Top,Bottom,Right'   # sabit genişlik (450), pencere büyüyünce sağa kayar
 [void](New-UiLabel $gGrp 'Grup ara:' 10 26 60)
 $txtFilter = New-UiTextBox $gGrp 72 23 368
 $txtFilter.Anchor = 'Top,Left,Right'
@@ -415,7 +447,8 @@ $lblDlStatusNote.ForeColor = [System.Drawing.Color]::DimGray
 $tmrProgress = New-Object System.Windows.Forms.Timer
 $tmrProgress.Interval = 600
 $tmrProgress.Add_Tick({ Update-DownloadGrid })
-$form.Controls.Add($tmrProgress)
+# Not: System.Windows.Forms.Timer bir Control değildir; $form.Controls.Add ile eklenmez.
+# $script: kapsamındaki değişken olarak yaşamaya devam eder, Start()/Stop() yeterlidir.
 
 # --- İşlemler ---
 $gAct = New-UiGroup $form 'İşlemler' 10 958 1260 62
