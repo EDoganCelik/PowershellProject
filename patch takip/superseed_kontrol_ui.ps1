@@ -15,9 +15,16 @@
     - "Ortamdaki TÜM Superseded + Deploy edilmiş güncellemeler" kaynağı: state.json'a veya tek tek Package/SUG
       gezmeye gerek kalmadan, ortamdaki tüm superseded (istenirse Expired) güncellemeleri TEK sorguyla okur ve
       yalnızca deploy edilmiş bir SUG'a (SMS_UpdateGroupAssignment) üye olanları listeler.
-    - "Ortamdaki TÜM Deployment Package'larda indirilmiş + Superseded güncellemeler" kaynağı: ortamdaki tüm superseded
-      güncellemeleri tek sorguyla okur ve içeriği herhangi bir Software Update Deployment Package'a indirilmiş
-      (SMS_PackageToContent) olanları, bulundukları Package ID'leriyle listeler. "Seçilileri Package'tan Sil" bu modda da kullanılabilir.
+    - "Ortamdaki TÜM Package'larda indirilmiş + Superseded + Deploy edilmiş güncellemeler" kaynağı: ortamdaki tüm
+      superseded güncellemeleri tek sorguyla okur; içeriği herhangi bir Software Update Deployment Package'a indirilmiş
+      (SMS_PackageToContent) VE deploy edilmiş bir SUG'a (SMS_UpdateGroupAssignment) üye olanları, bulundukları
+      Package ID'leriyle listeler. "Seçilileri Package'tan Sil" bu modda da kullanılabilir.
+    - "Ortamdaki TÜM Package'larda indirilmiş + Superseded güncellemeler" kaynağı: yukarıdakinin DEPLOY şartı olmayan
+      hâli. Ortamdaki tüm superseded güncellemeleri tek sorguyla okur; içeriği herhangi bir Software Update Deployment
+      Package'a indirilmiş (SMS_PackageToContent) olanları, deploy edilmiş olup olmadıklarına bakmadan listeler.
+      "Seçilileri Package'tan Sil" bu modda da kullanılabilir.
+    - "Vendor" kutusu: yalnızca "Company" kategorisi bu değere eşit olan güncellemeler listelenir (varsayılan: Microsoft).
+      Boş bırakılırsa vendor filtresi uygulanmaz. Tüm kaynak modları için geçerlidir.
     - Sağ tarafta ortamdaki TÜM Software Update Group'lar listelenir (SCCM'deki "Edit Membership" penceresi gibi).
       Seçili güncellemeler için kutular şöyle çalışır:
           işaretli   : seçili güncellemelerin hepsi grubun üyesi (işaretlerseniz eksikler EKLENİR)
@@ -59,6 +66,13 @@ $script:EnvPackages  = @()      # ortamdaki tüm Software Update Deployment Pack
 $script:DeployedIds  = @{}      # deploy edilmiş SUG (ve varsa doğrudan güncelleme) CI_ID'leri (string -> $true)
 $script:ExcludedPkgs = @{}      # silmeden HARİÇ tutulacak PackageID'ler (string -> bool)
 $script:PkgNames     = @{}      # PackageID (string) -> package adı
+$script:VendorFilter = ''       # Listele sırasında uygulanan vendor (Company kategorisi); boşsa filtre yok
+$script:VendorSkipped = 0       # vendor filtresiyle elenen kayıt sayacı
+$script:VendorNoInfo  = 0       # kategori bilgisi (UniqueIDs/Names) boş gelen kayıt sayacı
+$script:VendorUniqueIds = $null # vendor'a karşılık gelen Company kategorisinin CategoryInstance_UniqueID'leri (küçük harf)
+$script:VendorNames     = $null # vendor'a karşılık gelen Company kategori adları (küçük harf)
+$script:VendorCiIds     = $null # Company kategorisine bağlı güncelleme CI_ID'leri (SMS_CIAllCategories'ten)
+$script:VendorSample    = @()   # eşleşmeyen kayıtlardan teşhis örnekleri
 
 # ------------------------------------------------------------------
 # state.json okuma (SADECE okuma)
@@ -329,9 +343,14 @@ $btnReload.Anchor = 'Top,Right'
 $cmbState = New-Object System.Windows.Forms.ComboBox
 $cmbState.DropDownStyle = 'DropDownList'
 $cmbState.Location = New-Object System.Drawing.Point(85, 58)
-$cmbState.Size = New-Object System.Drawing.Size(790, 24)
+$cmbState.Size = New-Object System.Drawing.Size(560, 24)
 $cmbState.Anchor = 'Top,Left,Right'
 $gTop.Controls.Add($cmbState)
+$lblVendor = New-UiLabel $gTop 'Vendor:' 660 62 50
+$lblVendor.Anchor = 'Top,Right'
+$txtVendor = New-UiTextBox $gTop 712 58 160
+$txtVendor.Text = 'Microsoft'
+$txtVendor.Anchor = 'Top,Right'
 $chkExpired = New-Object System.Windows.Forms.CheckBox
 $chkExpired.Text = 'Expired olanları da listele'
 $chkExpired.Location = New-Object System.Drawing.Point(890, 60)
@@ -351,7 +370,9 @@ $cmbSource.Size = New-Object System.Drawing.Size(330, 24)
 [void]$cmbSource.Items.Add('Ortamdaki bir Software Update Group')
 [void]$cmbSource.Items.Add('Ortamdaki TÜM Package''lar + TÜM SUG''lar')
 [void]$cmbSource.Items.Add('Ortamdaki TÜM Superseded + Deploy edilmiş güncellemeler')
-[void]$cmbSource.Items.Add('Ortamdaki TÜM Package''larda indirilmiş + Superseded güncellemeler')
+[void]$cmbSource.Items.Add('Ortamdaki TÜM Package''larda indirilmiş + Superseded + Deploy edilmiş güncellemeler')
+[void]$cmbSource.Items.Add('Ortamdaki TÜM Package''larda indirilmiş + Superseded güncellemeler (deploy şartı yok)')
+$cmbSource.DropDownWidth = 520   # uzun seçenek adları açılır listede tam görünsün
 $cmbSource.SelectedIndex = 0
 $gTop.Controls.Add($cmbSource)
 [void](New-UiLabel $gTop 'Yapı:' 430 96 40)
@@ -594,7 +615,11 @@ function Get-SelectedScope {
             return @()
         }
         5 {
-            # Ortamdaki tüm Package'larda indirilmiş + superseded güncellemeler: kapsam gerekmez (tek sorguyla çözülür).
+            # Ortamdaki tüm Package'larda indirilmiş + superseded + deploy edilmiş güncellemeler: kapsam gerekmez (tek sorguyla çözülür).
+            return @()
+        }
+        6 {
+            # Ortamdaki tüm Package'larda indirilmiş + superseded güncellemeler (deploy şartı yok): kapsam gerekmez (tek sorguyla çözülür).
             return @()
         }
         default {
@@ -694,8 +719,95 @@ function Update-EnvCombo {
     $cmbEnv.Enabled = (($mode -eq 1 -or $mode -eq 2) -and $cmbEnv.Items.Count -gt 0)
 }
 
+# Vendor'a karşılık gelen Company kategorisini SMS_CategoryInstance'tan çözer (tek sorgu).
+# Güncelleme eşleştirmesi önce CategoryInstance_UniqueIDs ile, olmazsa kategori adı ile yapılır.
+function Import-VendorCategory {
+    param([string]$Vendor)
+    $v = $Vendor.Trim()
+    $script:VendorUniqueIds = New-Object 'System.Collections.Generic.HashSet[string]'
+    $script:VendorNames     = New-Object 'System.Collections.Generic.HashSet[string]'
+    [void]$script:VendorNames.Add($v.ToLowerInvariant())
+
+    $rows = @(Invoke-CMWql "SELECT CategoryInstance_UniqueID, LocalizedCategoryInstanceName FROM SMS_CategoryInstance WHERE CategoryTypeName = 'Company'")
+    $allNames = @()
+    $matched = @()
+    foreach ($r in $rows) {
+        $nm = ([string]$r.LocalizedCategoryInstanceName).Trim()
+        $allNames += $nm
+        if ($nm -ieq $v) { $matched += $r }
+    }
+    if ($matched.Count -eq 0) {
+        foreach ($r in $rows) {
+            if (([string]$r.LocalizedCategoryInstanceName).IndexOf($v, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $matched += $r }
+        }
+        if ($matched.Count -gt 0) { Write-Log "'$v' ile birebir eşleşen Company kategorisi yok; adında geçenler kullanılıyor." 'WARN' }
+    }
+    foreach ($r in $matched) {
+        $id = ([string]$r.CategoryInstance_UniqueID).Trim()
+        if ($id) { [void]$script:VendorUniqueIds.Add($id.ToLowerInvariant()) }
+        [void]$script:VendorNames.Add(([string]$r.LocalizedCategoryInstanceName).Trim().ToLowerInvariant())
+    }
+    # Güvenilir yol: Company kategorisine bağlı CI_ID'leri doğrudan SMS_CIAllCategories'ten oku
+    # (güncelleme satırındaki dizi alanlarının biçimine/doluluğuna bağımlı değil).
+    $script:VendorCiIds = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($r in $matched) {
+        $rawId = ([string]$r.CategoryInstance_UniqueID).Trim()
+        if (-not $rawId) { continue }
+        if ($rawId -notmatch '^[A-Za-z0-9:_\-\.]+$') { Write-Log "Geçersiz kategori UniqueID atlandı: '$rawId'" 'WARN'; continue }
+        try {
+            $ci = Invoke-CMWql "SELECT CI_ID FROM SMS_CIAllCategories WHERE CategoryInstance_UniqueID = '$rawId'"
+            foreach ($c in $ci) { [void]$script:VendorCiIds.Add([string]$c.CI_ID) }
+            Write-Log "SMS_CIAllCategories: '$rawId' kategorisine bağlı $($ci.Count) CI bulundu."
+        } catch {
+            Write-Log "SMS_CIAllCategories okunamadı: $($_.Exception.Message)" 'WARN'
+        }
+    }
+    $shown = (@($allNames | Sort-Object -Unique | Select-Object -First 40)) -join '; '
+    Write-Log "Ortamdaki Company kategorileri ($($rows.Count)): $shown"
+    if ($matched.Count -eq 0) {
+        Write-Log "Vendor '$v' için Company kategorisi bulunamadı. Yukarıdaki listeden birebir adı yazın veya vendor kutusunu boş bırakın." 'WARN'
+    } else {
+        Write-Log "Vendor eşleşmesi: $($matched.Count) Company kategorisi (UniqueID: $($script:VendorUniqueIds.Count))."
+    }
+}
+
 function Add-UpdateRecord {
     param($Row, [string]$PkgId)
+    # Vendor filtresi: güncellemenin Company kategorisi vendor'a karşılık gelmeli.
+    # 1) CategoryInstance_UniqueIDs, Import-VendorCategory ile çözülen Company UniqueID'si içeriyor mu?
+    # 2) Olmazsa LocalizedCategoryInstanceNames içinde vendor adı (büyük/küçük harf duyarsız) geçiyor mu?
+    # Ek sorgu gerekmez; zaten okunan satırdan bellekte kontrol edilir.
+    if ($script:VendorFilter) {
+        $hit = $false
+        $hasInfo = $false
+        if ($null -ne $script:VendorCiIds -and $script:VendorCiIds.Contains([string]$Row.CI_ID)) { $hit = $true }
+        if (-not $hit) {
+        foreach ($u in @($Row.CategoryInstance_UniqueIDs)) {
+            if ($null -eq $u) { continue }
+            $us = ([string]$u).Trim()
+            if (-not $us) { continue }
+            $hasInfo = $true
+            if ($null -ne $script:VendorUniqueIds -and $script:VendorUniqueIds.Contains($us.ToLowerInvariant())) { $hit = $true; break }
+        }
+        }
+        if (-not $hit) {
+            foreach ($n in @($Row.LocalizedCategoryInstanceNames)) {
+                if ($null -eq $n) { continue }
+                $ns = ([string]$n).Trim()
+                if (-not $ns) { continue }
+                $hasInfo = $true
+                if ($null -ne $script:VendorNames -and $script:VendorNames.Contains($ns.ToLowerInvariant())) { $hit = $true; break }
+            }
+        }
+        if (-not $hit) {
+            if (-not $hasInfo) { $script:VendorNoInfo++ }
+            if ($script:VendorSample.Count -lt 3) {
+                $script:VendorSample += ('CI_ID {0} | Names=[{1}] | UniqueIDs=[{2}]' -f [string]$Row.CI_ID, ((@($Row.LocalizedCategoryInstanceNames)) -join ', '), ((@($Row.CategoryInstance_UniqueIDs)) -join ', '))
+            }
+            $script:VendorSkipped++
+            return
+        }
+    }
     $key = [string]$Row.CI_ID
     if (-not $script:Updates.ContainsKey($key)) {
         $art = [string]$Row.ArticleID
@@ -1001,7 +1113,7 @@ function Invoke-List {
         $mode = $cmbSource.SelectedIndex
         if ($mode -eq 3) { Import-Environment }
         $scope = @(Get-SelectedScope)
-        if ($scope.Count -eq 0 -and $mode -ne 4 -and $mode -ne 5) {
+        if ($scope.Count -eq 0 -and $mode -ne 4 -and $mode -ne 5 -and $mode -ne 6) {
             if ($mode -eq 0) { Show-Message 'Kullanılabilir bir state kaydı yok. Önce state.json dosyasını yükleyin.' 'Uyarı' 'Warning' }
             else             { Show-Message "Önce 'Ortamı Oku' düğmesiyle ortamdaki yapıları yükleyin ve listeden birini seçin." 'Uyarı' 'Warning' }
             return
@@ -1014,21 +1126,37 @@ function Invoke-List {
         Show-Groups
 
         $script:Updates = @{}
+        $script:VendorFilter = $txtVendor.Text.Trim()
+        $script:VendorSkipped = 0
+        $script:VendorNoInfo = 0
+        $script:VendorUniqueIds = $null
+        $script:VendorNames = $null
+        $script:VendorCiIds = $null
+        $script:VendorSample = @()
+        if ($script:VendorFilter) {
+            Write-Log "Vendor filtresi: '$($script:VendorFilter)'"
+            try { Import-VendorCategory -Vendor $script:VendorFilter }
+            catch { Write-Log "Company kategorisi okunamadı, yalnızca ad eşleşmesi kullanılacak: $($_.Exception.Message)" 'WARN'
+                    $script:VendorNames = New-Object 'System.Collections.Generic.HashSet[string]'
+                    [void]$script:VendorNames.Add($script:VendorFilter.ToLowerInvariant()) }
+        } else { Write-Log 'Vendor filtresi yok (tüm vendor''lar).' }
         if ($chkExpired.Checked) { $flt = '(su.IsSuperseded = 1 OR su.IsExpired = 1)' }
         else                     { $flt = 'su.IsSuperseded = 1' }
 
         $script:DeployedIds = @{}
 
-        # Ortamdaki TÜM superseded güncellemeler (mod 4 ve 5): Package/SUG gezmeden TEK sorgu.
+        # Ortamdaki TÜM superseded güncellemeler (mod 4, 5 ve 6): Package/SUG gezmeden TEK sorgu.
         # Mod 4: deploy filtresi, üyelikler okunduktan sonra aşağıda bellekte uygulanır.
-        # Mod 5: Package filtresi burada uygulanır (içeriği hiçbir Deployment Package'ta olmayanlar elenir).
-        if ($mode -eq 4 -or $mode -eq 5) {
+        # Mod 5: Package filtresi burada uygulanır (içeriği hiçbir Deployment Package'ta olmayanlar elenir);
+        #        ardından Mod 4 ile aynı deploy filtresi de uygulanır (indirilmiş + superseded + deploy edilmiş).
+        # Mod 6: Mod 5'in yalnızca Package filtresi uygulanır; deploy filtresi YOKTUR (indirilmiş + superseded).
+        if ($mode -eq 4 -or $mode -eq 5 -or $mode -eq 6) {
             Write-Log 'Ortamdaki superseded güncellemeler tek sorguyla okunuyor...'
             $rows = Invoke-CMWql "SELECT * FROM SMS_SoftwareUpdate AS su WHERE $flt"
             foreach ($r in $rows) { Add-UpdateRecord -Row $r -PkgId $null }
             Write-Log "$($script:Updates.Count) superseded güncelleme okundu."
 
-            if ($mode -eq 5) {
+            if ($mode -eq 5 -or $mode -eq 6) {
                 Write-Log 'Deployment Package içerikleri eşleştiriliyor (indirilmiş olanlar aranıyor)...'
                 Import-UpdatePackages -Filter $flt
                 $before = $script:Updates.Count
@@ -1063,10 +1191,24 @@ function Invoke-List {
             }
         }
 
+        if ($script:VendorFilter) {
+            Write-Log "Vendor filtresi: $($script:Updates.Count) güncelleme kaldı ($($script:VendorSkipped) kayıt vendor '$($script:VendorFilter)' dışında olduğu için elendi)."
+            if ($script:VendorNoInfo -gt 0) {
+                Write-Log "$($script:VendorNoInfo) kayıtta kategori bilgisi (CategoryInstance_UniqueIDs / LocalizedCategoryInstanceNames) BOŞ geldi; bu kayıtlar vendor filtresinde elendi. Çok sayıdaysa sorgu bu alanları döndürmüyor demektir." 'WARN'
+            }
+            if ($script:Updates.Count -eq 0 -and $script:VendorSample.Count -gt 0) {
+                Write-Log 'Eşleşmeyen kayıtlardan örnek kategori değerleri (teşhis):' 'WARN'
+                foreach ($s in $script:VendorSample) { Write-Log "  $s" 'WARN' }
+            }
+            if ($script:Updates.Count -eq 0 -and $script:VendorSkipped -gt 0) {
+                Write-Log "Vendor '$($script:VendorFilter)' ile eşleşen güncelleme yok. Vendor adı 'Company' kategorisiyle birebir aynı olmalı (örn. Microsoft); tüm vendor'lar için kutuyu boş bırakın." 'WARN'
+            }
+        }
+
         Write-Log 'SUG üyelikleri okunuyor...'
         Import-Memberships
 
-        if ($mode -eq 4) {
+        if ($mode -eq 4 -or $mode -eq 5) {
             Write-Log 'Deploy edilmiş SUG''lar okunuyor (SMS_UpdateGroupAssignment)...'
             $script:DeployedIds = Get-DeployedCIIds
             Write-Log "$($script:DeployedIds.Count) deploy hedefi (SUG) bulundu."
@@ -1305,6 +1447,65 @@ function Remove-PackageContentVerified {
     return [pscustomobject]@{ Total = $ContentIds.Count; Remaining = $remaining; Method = $method }
 }
 
+# Paylaşılan içeriklerin (seçili olmayan güncellemelerle ortak) "sahiplerini" SMS_SoftwareUpdate'ten çözer.
+# Bir sahip, AKTİF (superseded/expired değil) veya deploy edilmiş ise o içeriğin silinmesine ENGEL sayılır.
+# Superseded/Expired ve deploy edilmemiş sahipler engel sayılmaz (içerik onlar için de gereksiz).
+function Get-SharedContentDetails {
+    param([object[]]$Pairs, [string[]]$SelectedIds, [uint32[]]$SharedContentIds)
+
+    $sel = @{}
+    foreach ($x in $SelectedIds) { $sel[[string]$x] = $true }
+    $shared = @{}
+    foreach ($c in $SharedContentIds) { $shared[[string]$c] = $true }
+
+    $othersByContent = @{}
+    $allOthers = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($p in $Pairs) {
+        $c  = [string]$p.ContentID
+        $ci = [string]$p.CI_ID
+        if (-not $shared.ContainsKey($c) -or $sel.ContainsKey($ci)) { continue }
+        if (-not $othersByContent.ContainsKey($c)) { $othersByContent[$c] = New-Object 'System.Collections.Generic.HashSet[string]' }
+        [void]$othersByContent[$c].Add($ci)
+        [void]$allOthers.Add($ci)
+    }
+
+    $meta = @{}
+    $list = @($allOthers | Where-Object { $_ -match '^\d+$' })
+    for ($i = 0; $i -lt $list.Count; $i += 40) {
+        $last = [Math]::Min($i + 39, $list.Count - 1)
+        $inList = ($list[$i..$last]) -join ','
+        foreach ($r in (Invoke-CMWql "SELECT * FROM SMS_SoftwareUpdate WHERE CI_ID IN ($inList)")) { $meta[[string]$r.CI_ID] = $r }
+    }
+
+    $free = @()
+    $blocked = @{}
+    $lines = @()
+    foreach ($c in @($othersByContent.Keys)) {
+        $blockers = @()
+        foreach ($ci in $othersByContent[$c]) {
+            $r = $meta[$ci]
+            if ($null -eq $r) {
+                $lines += ("  ContentID {0} <- CI_ID {1}: SMS_SoftwareUpdate'te kayıt yok (silinmiş veya güncelleme değil); engel sayılmadı." -f $c, $ci)
+                continue
+            }
+            $sup = [bool]$r.IsSuperseded
+            $exp = [bool]$r.IsExpired
+            $dep = [bool]$r.IsDeployed
+            $st = @()
+            if ($sup) { $st += 'Superseded' }
+            if ($exp) { $st += 'Expired' }
+            if (-not $sup -and -not $exp) { $st += 'AKTİF' }
+            if ($dep) { $st += 'Deploy edilmiş' }
+            $block = ($dep -or (-not $sup -and -not $exp))
+            $title = [string]$r.LocalizedDisplayName
+            $lines += ("  ContentID {0} <- CI_ID {1} | {2} | {3} | {4}" -f $c, $ci, ($st -join ', '), $(if ($block) { 'ENGEL' } else { 'engel değil' }), $title)
+            if ($block) { $blockers += ("CI_ID {0}: {1} [{2}]" -f $ci, $title, ($st -join ', ')) }
+        }
+        if ($blockers.Count -gt 0) { $blocked[$c] = $blockers } else { $free += [uint32]$c }
+    }
+    return [pscustomobject]@{ Free = [uint32[]]$free; Blocked = $blocked; Lines = $lines }
+}
+
 function Invoke-RemoveFromPackage {
     $sel = @(Get-SelectedUpdateIds)
     if ($sel.Count -eq 0) { Show-Message 'Önce soldaki listeden en az bir güncelleme seçin.' 'Uyarı' 'Warning'; return }
@@ -1378,12 +1579,50 @@ function Invoke-RemoveFromPackage {
             Write-Log "[$pkgId] içerik eşleşmeleri okunuyor..."
             $pairs = Invoke-CMWql "SELECT cc.CI_ID, cc.ContentID FROM SMS_CIToContent AS cc JOIN SMS_PackageToContent AS pc ON pc.ContentID = cc.ContentID WHERE pc.PackageID = '$pkgId'"
             $set = Get-ContentRemovalSet -Pairs $pairs -SelectedIds $ids
+            $totalContents = @($pairs | ForEach-Object { [string]$_.ContentID } | Select-Object -Unique).Count
+            Write-Log "[$pkgId] $($ids.Count) seçili güncelleme | package'ta eşleşen içerik: $totalContents | doğrudan silinebilir: $($set.Remove.Count) | paylaşılan: $($set.Shared.Count)"
 
             if ($set.Shared.Count -gt 0) {
-                Write-Log "[$pkgId] $($set.Shared.Count) içerik, seçili olmayan başka güncellemelerle paylaşıldığı için ATLANDI." 'WARN'
+                $det = $null
+                try { $det = Get-SharedContentDetails -Pairs $pairs -SelectedIds $ids -SharedContentIds $set.Shared }
+                catch { Write-Log "[$pkgId] paylaşan güncellemelerin ayrıntıları okunamadı: $($_.Exception.Message)" 'WARN' }
+
+                if ($null -eq $det) {
+                    Write-Log "[$pkgId] $($set.Shared.Count) içerik, seçili olmayan başka güncellemelerle paylaşıldığı için ATLANDI." 'WARN'
+                } else {
+                    Write-Log "[$pkgId] Paylaşılan içerikler (seçili olmayan güncellemelerle ortak):" 'WARN'
+                    foreach ($ln in @($det.Lines | Select-Object -First 30)) { Write-Log $ln 'WARN' }
+                    if ($det.Lines.Count -gt 30) { Write-Log "  ... ve $($det.Lines.Count - 30) satır daha." 'WARN' }
+
+                    if ($det.Free.Count -gt 0) {
+                        Write-Log "[$pkgId] $($det.Free.Count) paylaşılan içeriğin diğer sahipleri superseded/expired ve deploy edilmemiş; silinecekler arasına eklendi." 'INFO'
+                        $set.Remove = [uint32[]](@($set.Remove) + @($det.Free))
+                    }
+                    $blockedKeys = @($det.Blocked.Keys)
+                    if ($blockedKeys.Count -gt 0) {
+                        Write-Log "[$pkgId] $($blockedKeys.Count) içerik AKTİF veya deploy edilmiş güncellemelerle paylaşıldığı için atlandı." 'WARN'
+                        if (-not $simulate) {
+                            $bl = @()
+                            foreach ($k in $blockedKeys) { $bl += $det.Blocked[$k] }
+                            $bl = @($bl | Select-Object -Unique)
+                            $txt = "[$pkgId] $($blockedKeys.Count) içerik, aşağıdaki aktif/deploy edilmiş güncellemelerle paylaşılıyor:`n`n" +
+                                   (($bl | Select-Object -First 8) -join "`n")
+                            if ($bl.Count -gt 8) { $txt += "`n... ve $($bl.Count - 8) güncelleme daha." }
+                            $txt += "`n`nBu içeriği silerseniz bu güncellemeler bu package'ta içeriksiz kalır. Yine de silinsin mi?"
+                            if ([System.Windows.Forms.MessageBox]::Show($txt, 'Paylaşılan içerik', 'YesNo', 'Warning', 'Button2') -eq 'Yes') {
+                                $set.Remove = [uint32[]](@($set.Remove) + @($blockedKeys | ForEach-Object { [uint32]$_ }))
+                                Write-Log "[$pkgId] Kullanıcı onayıyla paylaşılan $($blockedKeys.Count) içerik de silinecek." 'WARN'
+                            }
+                        }
+                    }
+                }
             }
             if ($set.Remove.Count -eq 0) {
-                Write-Log "[$pkgId] silinecek içerik bulunamadı." 'WARN'
+                if ($set.Shared.Count -gt 0) {
+                    Write-Log "[$pkgId] seçili güncellemelerin tüm içeriği başka güncellemelerle paylaşıldığı için bu package atlandı." 'WARN'
+                } else {
+                    Write-Log "[$pkgId] silinecek içerik bulunamadı (seçili güncellemelerin bu package'ta içerik eşleşmesi yok)." 'WARN'
+                }
                 continue
             }
             if ($simulate) {

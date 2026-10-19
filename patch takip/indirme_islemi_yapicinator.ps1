@@ -266,12 +266,74 @@ function Enable-ColumnDoubleClickExpand {
 }
 
 # ------------------------------------------------------------------
+# Fare tekerleği ile form kaydırma
+# Fare, kendi kaydırma çubuğu olan bir nesnenin (grid, günlük kutusu, açık liste) üzerinde değilse tekerlek formu kaydırır.
+# ------------------------------------------------------------------
+if (-not ('FormWheelScrollFilter' -as [type])) {
+    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @"
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public sealed class FormWheelScrollFilter : IMessageFilter
+{
+    [DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(Point p);
+
+    private readonly ScrollableControl _host;
+    public FormWheelScrollFilter(ScrollableControl host) { _host = host; }
+
+    public bool PreFilterMessage(ref Message m)
+    {
+        if (m.Msg != 0x020A) return false;                      // WM_MOUSEWHEEL
+        if (!_host.IsHandleCreated || !_host.VerticalScroll.Visible) return false;
+
+        Control c = Control.FromHandle(WindowFromPoint(Cursor.Position));
+        if (c == null) return false;                            // örn. açık combobox listesi: dokunma
+        bool inside = false;
+        for (Control p = c; p != null; p = p.Parent) { if (p == _host) { inside = true; break; } }
+        if (!inside) return false;
+        if (Form.ActiveForm != _host) return false;
+
+        DataGridView g = c as DataGridView;
+        if (g != null)
+        {
+            foreach (Control k in g.Controls)
+            {
+                VScrollBar v = k as VScrollBar;
+                if (v != null && v.Visible) return false;       // grid kendi kaydırmasını kullansın
+            }
+        }
+        TextBoxBase tb = c as TextBoxBase;
+        if (tb != null && tb.Multiline && tb.Lines.Length * tb.Font.Height > tb.ClientSize.Height) return false;
+        ComboBox cb = c as ComboBox;
+        if (cb != null && cb.DroppedDown) return false;
+
+        int delta = unchecked((short)((m.WParam.ToInt64() >> 16) & 0xFFFF));
+        int dy = (int)(delta / 120.0 * SystemInformation.MouseWheelScrollLines * 16);
+        Point pos = _host.AutoScrollPosition;                   // değerler negatif gelir
+        _host.AutoScrollPosition = new Point(-pos.X, -pos.Y - dy);
+        return true;
+    }
+}
+"@
+}
+
+# ------------------------------------------------------------------
 # Form
 # ------------------------------------------------------------------
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'SCCM - Required Güncellemeler & SUG Üyelik Yönetimi'
-$form.ClientSize = New-Object System.Drawing.Size(1280, 1214)
-$form.MinimumSize = New-Object System.Drawing.Size(1100, 1114)
+# Yerleşim 1280x1214 olarak tasarlandı. Formun gösterilebilir ASGARİ yerleşim alanı 1100x1114'tür:
+# pencere (ekran) bundan küçükse nesneler sıkışmaz, form kaydırma çubukları çıkar (fare tekerleği ile de kaydırılır).
+# Asgari değerin üstünde kalan alanda nesneler (anchor'lar sayesinde) genişleyip uzamaya devam eder.
+$script:LayoutMinW = 1100
+$script:LayoutMinH = 1114
+$form.ClientSize = New-Object System.Drawing.Size(1280, 1214)       # kontroller bu tasarım boyutuna göre yerleştirilir
+$form.AutoScroll = $true
+$form.AutoScrollMinSize = New-Object System.Drawing.Size($script:LayoutMinW, $script:LayoutMinH)
+$form.MinimumSize = New-Object System.Drawing.Size(640, 420)         # pencere küçültülebilir; sığmayan kısım kaydırılır
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
@@ -1345,5 +1407,16 @@ $form.Add_FormClosing({
 Write-Log 'Hazır. Filtreyi kontrol edip "Listele" düğmesine basın. Varsayılan olarak SİMÜLASYON açıktır.'
 Import-ConnectionDefaults
 $lblCount.Text = 'Henüz liste yüklenmedi.'
+
+# Başlangıç boyutu: tasarım boyutu ekrana sığmıyorsa çalışma alanına göre kırpılır.
+# Yerleşim asgari alanın (1100x1114) altına inerse form kaydırma çubukları gösterir; tümünü sığdırmaya çalışmayız.
+$wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+$capW = [Math]::Min(1280, $wa.Width - 20)
+$capH = [Math]::Min(1214, $wa.Height - 60)    # başlık çubuğu + kenarlık payı
+$form.ClientSize = New-Object System.Drawing.Size($capW, $capH)
+
+$script:WheelFilter = New-Object FormWheelScrollFilter($form)
+[System.Windows.Forms.Application]::AddMessageFilter($script:WheelFilter)
+$form.Add_FormClosed({ [System.Windows.Forms.Application]::RemoveMessageFilter($script:WheelFilter) })
 
 [void]$form.ShowDialog()
