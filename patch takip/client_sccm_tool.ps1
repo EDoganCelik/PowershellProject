@@ -1768,7 +1768,8 @@ function Get-ComputerList {
     $valid = @()
     $bad = @()
     foreach ($n in $raw) {
-        if ($n -match '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+        # Türkçe karakterleri (İ, ı, Ş, ş, Ğ, ğ, Ü, ü, Ö, ö, Ç, ç) destekleyecek şekilde güncellendi
+        if ($n -match '^[A-Za-zİıŞşĞğÜüÖöÇç0-9][A-Za-zİıŞşĞğÜüÖöÇç0-9._-]*$') {
             if ($valid -notcontains $n) { $valid += $n }
         }
         else { $bad += $n }
