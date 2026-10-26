@@ -92,6 +92,7 @@ $script:RetryButtons   = @{}
 $script:SumDirty       = @{ 1 = $true; 2 = $true }
 $script:DirtyRows      = New-Object 'System.Collections.Generic.HashSet[object]'   # V7: Durum'u yeniden hesaplanacak Panel 2 satirlari
 $script:Auto           = @{}          # V13: panel -> otomatik yenileme ayarlari
+$script:SccmExtra      = New-NameMap  # kisa ad -> @(Boundary Group(s), Operating System Build) (son toplu SCCM sorgusundan)
 $script:ReportQueue    = New-Object System.Collections.ArrayList   # gosterilmeyi bekleyen servis baslatma raporlari
 $script:ShowingReport  = $false
 $script:ParserSvc      = New-NameMap  # Panel 2: Hostname -> son servis durumu (IsOnline + ServiceDetail; Panel 2 "Servisleri Baslat" icin)
@@ -106,6 +107,8 @@ $script:ParserColumns = @('Hostname;UpdateName;EvalState;PercentComplete;ErrorCo
 $script:ParserLegacyColumns = @($script:ParserColumns | Where-Object { $_ -ne 'SoftwareDistribution_BoyutMB' -and $_ -ne 'DTS_DP_IndirmeHatalari' })
 
 # Panel 2'de parse sonrasi eklenen kontrol kolonlari
+# SCCM'den (SMS_CombinedDeviceResources) toplu sorguyla gelen kolonlar - Panel 1: BoundaryGroups / OsBuild
+$script:ParserSccmColumns = @('Boundary_Groups', 'OS_Build')
 $script:ParserCheckColumns = @('DNS_Durumu', 'Online_mi', 'AD_Durumu', 'AD_LastLogon', 'Calisan_Servisler', 'Calismayan_Servisler', 'CcmExec_Durumu', 'SCCM_Kayit')
 
 # SCCM istemci eylemleri: gorunen ad -> TriggerSchedule ScheduleID listesi
@@ -364,20 +367,52 @@ function Get-HostReach {
     return $r
 }
 
-function Convert-FileTimeSafe {
-    param($Value)
-    try {
-        $v = [int64]$Value
-        if ($v -le 0 -or $v -ge [int64]::MaxValue) { return $null }
-        return [DateTime]::FromFileTime($v)
+function Read-FastCsv {
+    # Hizli CSV okuyucu (Import-Csv yerine). Import-Csv her satir icin PSObject uretir ve 100.000 satirda saniyeler surer;
+    # burada satirlar dogrudan string[] olarak okunur. Bicim: ';' ayracli, alanlar "..." icinde ("" = "), ilk satir baslik
+    # (Export-Csv ve Write-FastCsv ciktisi). Tirnaksiz satirlar ';' ile bolunur. Doner: Header (string[]), Rows (List[string[]])
+    param([string]$Path)
+    $rows = New-Object 'System.Collections.Generic.List[string[]]'
+    $header = $null
+    $sep = [string[]]@('";"')
+    foreach ($line in [System.IO.File]::ReadLines($Path, [System.Text.Encoding]::UTF8)) {
+        if ($line.Length -eq 0) { continue }
+        if ($line.Length -ge 2 -and $line[0] -eq '"' -and $line[$line.Length - 1] -eq '"') {
+            $f = $line.Substring(1, $line.Length - 2).Split($sep, [System.StringSplitOptions]::None)
+            for ($i = 0; $i -lt $f.Length; $i++) { if ($f[$i].IndexOf('""') -ge 0) { $f[$i] = $f[$i].Replace('""', '"') } }
+        }
+        else { $f = $line.Split(';') }
+        if ($null -eq $header) { $header = $f } else { $rows.Add($f) }
     }
-    catch { return $null }
+    return [pscustomobject]@{ Header = $header; Rows = $rows }
+}
+
+function Write-FastCsv {
+    # Hizli CSV yazici (Export-Csv yerine): StreamWriter, UTF-8 (BOM), ';' ayrac, tum alanlar tirnakli -> Turkce Excel'de
+    # dogrudan kolonlara ayrilir. Rows: string[] dizileri (Header sirasinda) VEYA nesneler (Header'daki ozellik adlariyla okunur).
+    # string[] satirlarda tirnak yoksa satir tek [string]::Join ile kurulur (hucre hucre dongu yok).
+    param([string]$Path, [string[]]$Header, $Rows)
+    $w = New-Object System.IO.StreamWriter ($Path, $false, (New-Object System.Text.UTF8Encoding ($true)))
+    try {
+        $w.WriteLine('"' + [string]::Join('";"', $Header) + '"')
+        $n = $Header.Count
+        $vals = New-Object string[] $n
+        foreach ($r in $Rows) {
+            if ($r -is [string[]] -and $r.Length -eq $n) { $vals = $r.Clone() }
+            else { for ($i = 0; $i -lt $n; $i++) { $vals[$i] = [string]$r.($Header[$i]) } }
+            for ($i = 0; $i -lt $n; $i++) { if ($null -eq $vals[$i]) { $vals[$i] = '' } elseif ($vals[$i].IndexOf('"') -ge 0) { $vals[$i] = $vals[$i].Replace('"', '""') } }
+            $w.WriteLine('"' + [string]::Join('";"', $vals) + '"')
+        }
+    }
+    finally { $w.Dispose() }
 }
 
 function Get-AdCacheIndex {
-    # AD onbellek CSV'sini okuyup hostname -> kayit hashtable'i dondurur. Yol $env:CLIENTTOOL_ADCACHE_FILE'dan alinir
-    # (process geneli; runspace'ler de gorur). Veri runspace icinde bellekte tutulur; CSV degisince yeniden okunur.
-    $r = [pscustomobject]@{ Ok = $false; Error = ''; Map = $null; Count = 0; Time = $null }
+    # AD onbellek CSV'sini (Hostname;Domain;Enabled;LastLogonTimestamp;DistinguishedName;CacheTime) okuyup
+    # kisa ad -> string[] satir haritasi dondurur. Dosya yolu $env:CLIENTTOOL_ADCACHE_FILE (process geneli).
+    # PERFORMANS: harita AppDomain'de TEK kopya tutulur; 10 runspace + UI ayni veriyi paylasir, CSV sadece dosya
+    # degisince (LastWriteTime) ve sadece BIR kez okunur (kilitli). Okuma Read-FastCsv ile (Import-Csv degil).
+    $r = [pscustomobject]@{ Ok = $false; Error = ''; Map = $null; Dup = $null; Count = 0; Time = $null }
 
     $file = [string]$env:CLIENTTOOL_ADCACHE_FILE
     if (-not $file) { $r.Error = 'AD onbellek dosya yolu tanimli degil'; return $r }
@@ -385,44 +420,58 @@ function Get-AdCacheIndex {
         $r.Error = "AD onbellegi bulunamadi ($file). 'AD Onbellegini Guncelle' ile olusturun."
         return $r
     }
-
-    $stamp = (Get-Item -LiteralPath $file).LastWriteTimeUtc
-    $mem   = $global:AdCacheMem
-    if ($mem -and $mem.File -eq $file -and $mem.Stamp -eq $stamp) {
-        $r.Ok = $true; $r.Map = $mem.Map; $r.Count = $mem.Count; $r.Time = $mem.Time
+    $stamp = [System.IO.File]::GetLastWriteTimeUtc($file)
+    $ad    = [System.AppDomain]::CurrentDomain
+    $lock  = $ad.GetData('ClientTool.AdCacheLock')
+    if ($lock) { [System.Threading.Monitor]::Enter($lock) }
+    try {
+        $mem = $ad.GetData('ClientTool.AdCache')
+        if (-not ($mem -and $mem.File -eq $file -and $mem.Stamp -eq $stamp)) {
+            # Guncelleme sirasinda dosya o an degisiyor olabilir: birkac kez dene
+            $csv = $null
+            for ($try = 0; $try -lt 3 -and $null -eq $csv; $try++) {
+                try { $csv = Read-FastCsv -Path $file } catch { Start-Sleep -Milliseconds 300 }
+            }
+            if ($null -eq $csv) {
+                if (-not ($mem -and $mem.File -eq $file)) { $r.Error = "AD onbellegi okunamadi: $file"; return $r }   # eldeki eski veriyle devam
+            }
+            else {
+                # Kolonlar ADIYLA bulunur (eski / farkli sirali dosyalar da okunur)
+                $ix = @{}
+                for ($i = 0; $i -lt $csv.Header.Count; $i++) { $ix[$csv.Header[$i]] = $i }
+                $iH = $ix['Hostname']; $iD = $ix['Domain']; $iE = $ix['Enabled']; $iL = $ix['LastLogonTimestamp']
+                # tr-TR'de I/i sorunu olmamasi icin OrdinalIgnoreCase. Deger: @(Domain, Enabled, LastLogon)
+                $map = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+                $dup = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($f in $csv.Rows) {
+                    if ($f.Length -le $iL) { continue }
+                    $k = $f[$iH].Trim()
+                    if (-not $k) { continue }
+                    $v = [string[]]@($f[$iD], $f[$iE], $f[$iL])
+                    $prev = $map[$k]
+                    if ($null -eq $prev) { $map[$k] = $v; continue }
+                    # Ayni isim birden fazla domain'de: en yeni lastLogonTimestamp'li kayit kullanilir
+                    $dup[$k] = if ($dup.ContainsKey($k)) { "$($dup[$k]), $($v[0])" } else { "$($prev[0]), $($v[0])" }
+                    if ([string]::CompareOrdinal($v[2], $prev[2]) -gt 0) { $map[$k] = $v }
+                }
+                $mem = [pscustomobject]@{ File = $file; Stamp = $stamp; Map = $map; Dup = $dup; Count = $csv.Rows.Count; Time = $stamp.ToLocalTime() }
+                $ad.SetData('ClientTool.AdCache', $mem)
+            }
+        }
+        $r.Ok = $true; $r.Map = $mem.Map; $r.Dup = $mem.Dup; $r.Count = $mem.Count; $r.Time = $mem.Time
         return $r
     }
-
-    # Guncelleme sirasinda dosya o an degisiyor olabilir: birkac kez dene
-    $rows = $null
-    for ($try = 0; $try -lt 3 -and $null -eq $rows; $try++) {
-        try { $rows = @(Import-Csv -LiteralPath $file -Delimiter ';' -Encoding UTF8 -ErrorAction Stop) }
-        catch { Start-Sleep -Milliseconds 300 }
-    }
-    if ($null -eq $rows) {
-        if ($mem -and $mem.File -eq $file) { $r.Ok = $true; $r.Map = $mem.Map; $r.Count = $mem.Count; $r.Time = $mem.Time; return $r }
-        $r.Error = "AD onbellegi okunamadi: $file"
-        return $r
-    }
-
-    # @{} anahtarlari GECERLI KULTURE gore karsilastirir (tr-TR'de I/i): kulturden bagimsiz OrdinalIgnoreCase kullanilir.
-    $map = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($row in $rows) {
-        $k = ([string]$row.Hostname).Trim()
-        if (-not $k) { continue }
-        if ($map.ContainsKey($k)) { $map[$k] = @($map[$k]) + $row } else { $map[$k] = $row }
-    }
-    $global:AdCacheMem = [pscustomobject]@{ File = $file; Stamp = $stamp; Map = $map; Count = $rows.Count; Time = $stamp.ToLocalTime() }
-    $r.Ok = $true; $r.Map = $map; $r.Count = $rows.Count; $r.Time = $global:AdCacheMem.Time
-    return $r
+    finally { if ($lock) { [System.Threading.Monitor]::Exit($lock) } }
 }
 
 function Get-AdOuComputers {
     # Bir domain'in verilen OU'larinin ALTINDAKI (alt OU'lar dahil) bilgisayar hesaplarini AD'den okur.
-    # Ayni domain'in OU'lari TEK is icinde sirayla taranir. Her OU'nun sonucu ayri doner.
+    # LIMIT YOK: -ResultSetSize $null = tum sonuclar; -ResultPageSize 1000 sadece sayfa boyutudur (AD'nin varsayilan
+    # MaxPageSize'i da 1000) - cmdlet 1000'erli sayfalarla TUM hesaplari getirir.
+    # PERFORMANS: satirlar PSCustomObject degil string[] (CSV kolon sirasi), List'e eklenir ('+=' yok).
     param([string]$Domain, [string[]]$SearchBases)
 
-    $items = @()
+    $items = New-Object System.Collections.ArrayList
     $modErr = ''
     if (-not (Get-Module -Name ActiveDirectory)) {
         try { Import-Module -Name ActiveDirectory -ErrorAction Stop -Verbose:$false }
@@ -430,33 +479,29 @@ function Get-AdOuComputers {
     }
 
     foreach ($sb in @($SearchBases)) {
-        $it = [pscustomobject]@{ SearchBase = [string]$sb; Ok = $false; Error = ''; Rows = @() }
-        if ($modErr) { $it.Error = $modErr; $items += $it; continue }
+        $it = [pscustomobject]@{ SearchBase = [string]$sb; Ok = $false; Error = ''; Rows = $null }
+        if ($modErr) { $it.Error = $modErr; [void]$items.Add($it); continue }
         try {
-            $comps = @(Get-ADComputer -Filter * -SearchBase $sb -SearchScope Subtree -Server $Domain `
-                    -Properties @('Enabled', 'LastLogonTimestamp', 'DistinguishedName') -ResultPageSize 1000 -ErrorAction Stop)
-            $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-            $it.Rows = @(foreach ($c in $comps) {
-                $t = Convert-FileTimeSafe $c.LastLogonTimestamp
-                [pscustomobject]@{
-                    Hostname           = [string]$c.Name
-                    Domain             = $Domain
-                    Enabled            = [string][bool]$c.Enabled
-                    LastLogonTimestamp = $(if ($t) { $t.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
-                    DistinguishedName  = [string]$c.DistinguishedName
-                    CacheTime          = $now
-                }
-            })
+            $now  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $rows = New-Object 'System.Collections.Generic.List[string[]]'
+            foreach ($c in (Get-ADComputer -Filter * -SearchBase $sb -SearchScope Subtree -Server $Domain -ResultSetSize $null -ResultPageSize 1000 `
+                        -Properties @('Enabled', 'LastLogonTimestamp', 'DistinguishedName') -ErrorAction Stop)) {
+                $ll = ''
+                $ft = $c.LastLogonTimestamp
+                if ($ft -is [long] -and $ft -gt 0 -and $ft -lt [long]::MaxValue) { $ll = [DateTime]::FromFileTime($ft).ToString('yyyy-MM-dd HH:mm:ss') }
+                $rows.Add([string[]]@([string]$c.Name, $Domain, [string][bool]$c.Enabled, $ll, [string]$c.DistinguishedName, $now))
+            }
+            $it.Rows = $rows
             $it.Ok = $true
         }
         catch { $it.Error = "AD sorgusu basarisiz: $($_.Exception.Message)" }
-        $items += $it
+        [void]$items.Add($it)
     }
     return [pscustomobject]@{ Domain = $Domain; Items = $items }
 }
 
 function Get-AdComputerInfo {
-    # AD bilgisini AD'ye SORGU ATMADAN onbellek CSV'sinden okur.
+    # AD bilgisini AD'ye SORGU ATMADAN onbellekten okur (Get-AdCacheIndex; harita degeri: Domain, Enabled, LastLogon).
     # Status: Enabled / Disabled / Bulunamadi / Sorgulanamadi. LastLogon: lastLogonTimestamp (~14 gun gecikmeli).
     param([string]$ComputerName)
 
@@ -465,21 +510,16 @@ function Get-AdComputerInfo {
     if (-not $idx.Ok) { $res.Status = 'Sorgulanamadi'; $res.Detail = $idx.Error; return $res }
 
     $short = (([string]$ComputerName -split '\.')[0]).Trim()
-    if (-not $idx.Map.ContainsKey($short)) {
+    $v = $idx.Map[$short]
+    if ($null -eq $v) {
         $res.Detail = "AD onbellegindeki OU'larda bulunamadi (onbellek: $($idx.Time.ToString('yyyy-MM-dd HH:mm')), $($idx.Count) kayit)"
         return $res
     }
-
-    # Ayni isim birden fazla domain'de varsa en yeni lastLogonTimestamp'e sahip olan secilir
-    $hits  = @($idx.Map[$short])
-    $found = $hits | Sort-Object -Property LastLogonTimestamp -Descending | Select-Object -First 1
-    if ($hits.Count -gt 1) {
-        $res.Detail = "Birden fazla domain'de bulundu ($((@($hits | ForEach-Object { $_.Domain }) -join ', '))); en yeni lastLogon'a sahip kayit kullanildi"
-    }
-    $res.Status = if ($found.Enabled -eq 'True') { 'Enabled' } else { 'Disabled' }
+    if ($idx.Dup.ContainsKey($short)) { $res.Detail = "Birden fazla domain'de bulundu ($($idx.Dup[$short])); en yeni lastLogon'a sahip kayit kullanildi" }
+    $res.Status = if ($v[1] -eq 'True') { 'Enabled' } else { 'Disabled' }
     $res.LastLogon = 'Hic'
-    if ($found.LastLogonTimestamp) {
-        try { $res.LastLogon = [DateTime]::ParseExact([string]$found.LastLogonTimestamp, 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture).ToString('yyyy-MM-dd HH:mm') }
+    if ($v[2]) {
+        try { $res.LastLogon = [DateTime]::ParseExact($v[2], 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture).ToString('yyyy-MM-dd HH:mm') }
         catch { }
     }
     return $res
@@ -656,25 +696,63 @@ function Get-NoResponseVerdict {
 
 function Get-SccmDeviceMap {
     # V2 - TOPLU SCCM KAYDI: SMS_R_System cihaz basina degil, $Chunk'lik parcalar halinde TEK sorguyla okunur
-    # (WQL'de IN yok: Name = 'a' OR Name = 'b' ...). Doner: kisa ad -> Get-SccmDevice ile ayni yapida kayit.
+    # (WQL'de IN yok: Name = 'a' OR Name = 'b' ...). Doner: kisa ad -> Get-SccmDevice ile ayni yapida kayit
+    # + BoundaryGroups / OsBuild: SMS_CombinedDeviceResources (konsoldaki "Boundary Group(s)" ve "Operating System Build"
+    # kolonlari) - ayni parca icin TEK ek sorgu. BoundaryGroups ConfigMgr 2002+; eski surumde sadece DeviceOSBuild okunur.
     param([string[]]$Names, [string]$SmsProvider, [string]$SiteCode, [int]$Chunk = 100)
 
+    $ns  = "root\SMS\site_$SiteCode"
     $map = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
     $shorts = @($Names | ForEach-Object { (([string]$_ -split '\.')[0]).Trim() } | Where-Object { $_ } | Sort-Object -Unique)
+    $cdrCols = 'ResourceID, Name, BoundaryGroups, DeviceOSBuild'   # ilk hatada 'ResourceID, Name, DeviceOSBuild'e duser
     for ($i = 0; $i -lt $shorts.Count; $i += $Chunk) {
         $part = @($shorts[$i..([Math]::Min($i + $Chunk, $shorts.Count) - 1)])
         $w = (($part | ForEach-Object { "Name = '$(ConvertTo-WqlString $_)'" }) -join ' OR ')
-        $rows = $null; $err = ''
+        $byName = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)   # ad -> aday listesi
+        $err = ''
         try {
-            $rows = @(Get-WmiObject -ComputerName $SmsProvider -Namespace "root\SMS\site_$SiteCode" -ErrorAction Stop `
-                    -Query "SELECT ResourceId, Name, Client, Active, Obsolete FROM SMS_R_System WHERE $w" |
-                ForEach-Object { [pscustomobject]@{ ResourceId = $_.ResourceId; Name = [string]$_.Name; Client = $_.Client; Active = $_.Active; Obsolete = $_.Obsolete } })
+            foreach ($o in @(Get-WmiObject -ComputerName $SmsProvider -Namespace $ns -ErrorAction Stop `
+                        -Query "SELECT ResourceId, Name, Client, Active, Obsolete FROM SMS_R_System WHERE $w")) {
+                $l = $byName[[string]$o.Name]
+                if ($null -eq $l) { $l = New-Object System.Collections.ArrayList; $byName[[string]$o.Name] = $l }
+                [void]$l.Add([pscustomobject]@{ ResourceId = $o.ResourceId; Name = [string]$o.Name; Client = $o.Client; Active = $o.Active; Obsolete = $o.Obsolete })
+            }
         }
         catch { $err = $_.Exception.Message }
+
+        # Boundary Group(s) + Operating System Build: ResourceID -> @(BoundaryGroups, DeviceOSBuild)
+        $cdr = @{}
+        $cdrErr = ''
+        if (-not $err) {
+            while ($true) {
+                try {
+                    foreach ($o in @(Get-WmiObject -ComputerName $SmsProvider -Namespace $ns -ErrorAction Stop -Query "SELECT $cdrCols FROM SMS_CombinedDeviceResources WHERE $w")) {
+                        $bg = if ($o.PSObject.Properties['BoundaryGroups']) { [string]$o.BoundaryGroups } else { '(bu SCCM surumunde yok)' }
+                        $cdr[[string]$o.ResourceID] = [string[]]@($bg, [string]$o.DeviceOSBuild)
+                    }
+                    break
+                }
+                catch {
+                    if ($cdrCols -like '*BoundaryGroups*') { $cdrCols = 'ResourceID, Name, DeviceOSBuild'; continue }   # ConfigMgr 2002 oncesi
+                    $cdrErr = $_.Exception.Message
+                    break
+                }
+            }
+        }
+
         foreach ($n in $part) {
-            if ($err) { $map[$n] = [pscustomobject]@{ Ok = $false; Error = $err; Cands = @(); Dev = $null }; continue }
-            $c = @($rows | Where-Object { [string]::Equals($_.Name, $n, [System.StringComparison]::OrdinalIgnoreCase) })
-            $map[$n] = [pscustomobject]@{ Ok = $true; Error = ''; Cands = $c; Dev = ($c | Where-Object { $_.Client -eq 1 -and $_.Obsolete -ne 1 } | Select-Object -First 1) }
+            if ($err) { $map[$n] = [pscustomobject]@{ Ok = $false; Error = $err; Cands = @(); Dev = $null; BoundaryGroups = '(sorgulanamadi)'; OsBuild = '(sorgulanamadi)' }; continue }
+            $c   = @(if ($byName.ContainsKey($n)) { $byName[$n] })
+            $dev = $c | Where-Object { $_.Client -eq 1 -and $_.Obsolete -ne 1 } | Select-Object -First 1
+            $bg = ''; $os = ''
+            if ($c.Count -eq 0) { $bg = $os = '(SCCM kaydi yok)' }
+            elseif ($cdrErr) { $bg = $os = '(sorgulanamadi)' }
+            else {
+                $ref = if ($dev) { $dev } else { $c[0] }
+                $v = $cdr[[string]$ref.ResourceId]
+                if ($v) { $bg = $v[0]; $os = $v[1] }
+            }
+            $map[$n] = [pscustomobject]@{ Ok = $true; Error = ''; Cands = $c; Dev = $dev; BoundaryGroups = $bg; OsBuild = $os }
         }
     }
     return $map
@@ -923,7 +1001,7 @@ function New-WorkerScript {
     # Ortak fonksiyonlarin kaynak kodunu worker scriptinin basina gomer; tanimlar TEK yerde tutulur.
     param([string]$ParamLine, [string]$CallLine, [string[]]$Funcs)
     $all = @('ConvertTo-WqlString', 'Get-ErrText', 'Test-Ping', 'Test-TcpPort', 'Get-NetBiosName', 'Get-WmiFailureReason', 'Get-WmiComputerName',
-        'Get-DnsWildcardIps', 'Resolve-HostDns', 'Get-HostReach', 'Convert-FileTimeSafe', 'Get-AdCacheIndex', 'Get-AdOuComputers', 'Get-AdComputerInfo', 'Get-ServiceCheck',
+        'Get-DnsWildcardIps', 'Resolve-HostDns', 'Get-HostReach', 'Read-FastCsv', 'Get-AdCacheIndex', 'Get-AdOuComputers', 'Get-AdComputerInfo', 'Get-ServiceCheck',
         'Get-RemoteStatus', 'Start-RemoteFix', 'Invoke-SccmClientAction', 'Get-NoResponseVerdict', 'Get-SccmDevice', 'Send-SccmScript',
         'Get-AdStructureStatus', 'New-SkippedScript', 'Invoke-ScriptWithAdCheck', 'Get-SccmRegistration', 'Get-ParserHostCheck', 'Invoke-ParserScriptRun')
     $defs = foreach ($n in $(if ($Funcs) { $Funcs } else { $all })) { "function $n {`n$((Get-Item -Path "function:$n").ScriptBlock.ToString())`n}" }
@@ -935,7 +1013,7 @@ $script:FixWorker          = New-WorkerScript '$ComputerName, $ServiceDetail' 'S
 $script:ActionWorker       = New-WorkerScript '$ComputerName, $ActionName, $ScheduleIds' 'Invoke-SccmClientAction -ComputerName $ComputerName -ActionName $ActionName -ScheduleIds $ScheduleIds'
 $script:ScriptWorker       = New-WorkerScript '$ComputerName, $SmsProvider, $SiteCode, $ScriptGuid, $ScriptName, $ParamB64, $TimeoutSec, $ServiceNames, $SccmInfo' 'Invoke-ScriptWithAdCheck -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -ScriptGuid $ScriptGuid -ScriptName $ScriptName -ParamB64 $ParamB64 -TimeoutSec $TimeoutSec -ServiceNames $ServiceNames -SccmInfo $SccmInfo'
 $script:AdWorker           = New-WorkerScript '$ComputerName' 'Get-AdStructureStatus -ComputerName $ComputerName'
-$script:AdCacheWorker      = New-WorkerScript '$Domain, $SearchBases' 'Get-AdOuComputers -Domain $Domain -SearchBases $SearchBases'
+$script:AdCacheWorker      = New-WorkerScript '$Domain, $SearchBases' 'Get-AdOuComputers -Domain $Domain -SearchBases $SearchBases' @('Get-AdOuComputers')
 $script:ParserCheckWorker  = New-WorkerScript '$ComputerName, $SmsProvider, $SiteCode, $ServiceNames, $SccmInfo' 'Get-ParserHostCheck -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -ServiceNames $ServiceNames -SccmInfo $SccmInfo'
 $script:VerdictWorker      = New-WorkerScript '$ComputerName, $TimeoutSec' 'Get-NoResponseVerdict -ComputerName $ComputerName -TimeoutSec $TimeoutSec'
 $script:PollWorker         = New-WorkerScript '$Items' 'Get-ScriptPollStatus -Items $Items' @('ConvertTo-WqlString', 'Select-ScriptStatusRow', 'Get-ScriptPollStatus')
@@ -977,6 +1055,8 @@ function Get-AdCacheFile  { return (Join-Path (Get-DataDir) 'AdComputerCache.csv
 # Paralel runspace'ler script degiskenlerini goremez; onbellek yolunu process geneli ortam degiskeniyle paylasiriz
 # (Get-AdCacheIndex bu degiskeni okur).
 $env:CLIENTTOOL_ADCACHE_FILE = Get-AdCacheFile
+# AD onbellek haritasi tum runspace'lerde TEK kopya (AppDomain); ayni anda tek runspace yukler
+if (-not [System.AppDomain]::CurrentDomain.GetData('ClientTool.AdCacheLock')) { [System.AppDomain]::CurrentDomain.SetData('ClientTool.AdCacheLock', (New-Object System.Object)) }
 
 function Write-ActionLog {
     param([string]$Hostname, [string]$Action, [string]$State, [string]$Text)
@@ -993,7 +1073,7 @@ function Write-ActionLog {
 
 $script:ResultsTable = New-Object System.Data.DataTable
 $script:ResultsTable.Locale = [System.Globalization.CultureInfo]::InvariantCulture   # tr-TR'de I/i eslesmesi icin
-foreach ($c in @('Hostname', 'DnsStatus', 'IsOnline', 'AdStatus', 'LastLogon', 'Running', 'NotRunning', 'CcmExec', 'LastAction', 'ActionResult', 'ErrorMessage', 'State')) {
+foreach ($c in @('Hostname', 'DnsStatus', 'IsOnline', 'AdStatus', 'LastLogon', 'Running', 'NotRunning', 'CcmExec', 'BoundaryGroups', 'OsBuild', 'LastAction', 'ActionResult', 'ErrorMessage', 'State')) {
     $null = $script:ResultsTable.Columns.Add($c)
 }
 $script:ResultsTable.PrimaryKey = @($script:ResultsTable.Columns['Hostname'])   # Rows.Find ile O(1) arama (CaseSensitive = false)
@@ -1005,6 +1085,7 @@ $script:ParseTable = New-Object System.Data.DataTable
 $script:ParseTable.Locale = [System.Globalization.CultureInfo]::InvariantCulture
 foreach ($c in $script:ParserColumns) { $null = $script:ParseTable.Columns.Add($c) }
 foreach ($c in $script:ParserCheckColumns) { $null = $script:ParseTable.Columns.Add($c) }
+foreach ($c in $script:ParserSccmColumns) { $null = $script:ParseTable.Columns.Add($c) }
 $null = $script:ParseTable.Columns.Add('KolonUyumu')
 $null = $script:ParseTable.Columns.Add('SourceHost')
 $null = $script:ParseTable.Columns.Add('Durum')   # V7: hesaplanan satir durumu (gizli; ozet cubugu / filtre / tekrar dene)
@@ -1661,33 +1742,53 @@ function Update-AdCacheFromWorker {
 function Save-AdCache {
     # Basarili OU'larin yeni verisini yazar; basarisiz OU'nun ESKI verisini korur (yarim guncelleme veri kaybettirmez).
     # CSV once gecici dosyaya yazilir, sonra yerine tasinir (calisan sorgular yarim dosya okumasin).
-    $file = Get-AdCacheFile
-    $old  = @()
+    # PERFORMANS: Read-FastCsv / Write-FastCsv (Import-Csv / Select-Object / Export-Csv degil), satirlar string[],
+    # eski veri domain'e gore BIR kez gruplanir, tekillestirme hashtable ile, '+=' yok.
+    $file   = Get-AdCacheFile
+    $header = [string[]]@('Hostname', 'Domain', 'Enabled', 'LastLogonTimestamp', 'DistinguishedName', 'CacheTime')
+
+    # Eski veri: domain -> satirlar (sadece basarisiz OU'lar icin gerekir)
+    $oldByDom = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
     if (Test-Path -LiteralPath $file) {
-        try { $old = @(Import-Csv -LiteralPath $file -Delimiter ';' -Encoding UTF8 -ErrorAction Stop) } catch { $old = @() }
+        try {
+            $csv = Read-FastCsv -Path $file
+            $ix = @{}
+            for ($i = 0; $i -lt $csv.Header.Count; $i++) { $ix[$csv.Header[$i]] = $i }
+            $order = @($header | ForEach-Object { $ix[$_] })
+            if (@($order | Where-Object { $null -eq $_ }).Count -eq 0) {
+                foreach ($f in $csv.Rows) {
+                    if ($f.Length -lt $header.Count) { continue }
+                    $row = [string[]]@($f[$order[0]], $f[$order[1]], $f[$order[2]], $f[$order[3]], $f[$order[4]], $f[$order[5]])
+                    $l = $oldByDom[$row[1]]
+                    if ($null -eq $l) { $l = New-Object 'System.Collections.Generic.List[string[]]'; $oldByDom[$row[1]] = $l }
+                    $l.Add($row)
+                }
+            }
+        }
+        catch { }
     }
 
-    $all      = New-Object System.Collections.ArrayList
+    $all      = New-Object 'System.Collections.Generic.List[string[]]'
     $okCount  = 0
-    $problems = @()
-    $summary  = @()
+    $problems = New-Object 'System.Collections.Generic.List[string]'
+    $summary  = New-Object 'System.Collections.Generic.List[string]'
     foreach ($s in @($script:AdCacheSources)) {
         $dom = [string]$s.Domain
         $ou  = [string]$s.OU
         $dr  = $script:AdCacheNew[$dom]
         $r   = $null
-        if ($dr) { $r = @($dr.Items | Where-Object { $_.SearchBase -eq $ou })[0] }
+        if ($dr) { foreach ($x in $dr.Items) { if ($x.SearchBase -eq $ou) { $r = $x; break } } }
         if ($r -and $r.Ok) {
             $okCount++
-            $n = 0
-            foreach ($row in @($r.Rows)) { [void]$all.Add($row); $n++ }
-            $summary += "${dom} [$ou]: $n makine"
+            if ($r.Rows) { $all.AddRange($r.Rows) }
+            $summary.Add("${dom} [$ou]: $(if ($r.Rows) { $r.Rows.Count } else { 0 }) makine")
         }
         else {
-            $keep = @($old | Where-Object { $_.Domain -eq $dom -and ([string]$_.DistinguishedName).EndsWith($ou, [System.StringComparison]::OrdinalIgnoreCase) })
-            foreach ($row in $keep) { [void]$all.Add($row) }
+            $n = 0
+            $l = $oldByDom[$dom]
+            if ($l) { foreach ($row in $l) { if ($row[4].EndsWith($ou, [System.StringComparison]::OrdinalIgnoreCase)) { $all.Add($row); $n++ } } }
             $why = if ($r -and $r.Error) { $r.Error } else { 'sonuc alinamadi' }
-            $problems += "${dom} [$ou]: $why`n   (eski veri korundu: $($keep.Count) kayit)"
+            $problems.Add("${dom} [$ou]: $why`n   (eski veri korundu: $n kayit)")
         }
     }
 
@@ -1698,25 +1799,16 @@ function Save-AdCache {
     }
 
     # Ic ice OU'lar ayni hesabi iki kez getirebilir: DistinguishedName'e gore tekillestir
-    $uniq = New-Object System.Collections.ArrayList
-    $seen = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+    $uniq = New-Object 'System.Collections.Generic.List[string[]]' ($all.Count)
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($row in $all) {
-        $k = [string]$row.DistinguishedName
-        if (-not $k) { $k = "$($row.Domain)|$($row.Hostname)" }
-        if ($seen.ContainsKey($k)) { continue }
-        $seen[$k] = $true
-        [void]$uniq.Add($row)
+        $k = if ($row[4]) { $row[4] } else { "$($row[1])|$($row[0])" }
+        if ($seen.Add($k)) { $uniq.Add($row) }
     }
 
     $tmp = "$file.tmp"
     try {
-        if ($uniq.Count -gt 0) {
-            $uniq | Select-Object Hostname, Domain, Enabled, LastLogonTimestamp, DistinguishedName, CacheTime |
-                Export-Csv -LiteralPath $tmp -Delimiter ';' -NoTypeInformation -Encoding UTF8
-        }
-        else {
-            Set-Content -LiteralPath $tmp -Value '"Hostname";"Domain";"Enabled";"LastLogonTimestamp";"DistinguishedName";"CacheTime"' -Encoding UTF8
-        }
+        Write-FastCsv -Path $tmp -Header $header -Rows $uniq
         Move-Item -LiteralPath $tmp -Destination $file -Force
     }
     catch {
@@ -1726,7 +1818,7 @@ function Save-AdCache {
 
     Update-AdCacheLabel
     $state = if ($problems.Count -gt 0) { 'warn' } else { 'ok' }
-    Write-ActionLog -Hostname '-' -Action 'AD onbellek guncelleme' -State $state -Text (($summary + $problems) -join ' | ')
+    Write-ActionLog -Hostname '-' -Action 'AD onbellek guncelleme' -State $state -Text ((@($summary) + @($problems)) -join ' | ')
     if ($problems.Count -gt 0) {
         [System.Windows.Forms.MessageBox]::Show("Onbellek guncellendi ancak bazi OU'lar alinamadi:`n`n" + ($problems -join "`n`n"), 'AD Onbellegi', 'OK', 'Warning') | Out-Null
     }
@@ -1901,14 +1993,13 @@ function Export-ToExcelAndOpen {
 }
 
 function Export-GridToCsv {
-    # ';' ayiracli UTF8 CSV (Turkce Excel'de dogrudan kolonlara ayrilir).
+    # ';' ayiracli UTF8 CSV (Turkce Excel'de dogrudan kolonlara ayrilir). Write-FastCsv ile (Export-Csv degil).
     param([object[]]$Data, [string]$DefaultFileName, [bool]$OpenAfter = $false, [string]$InitialDirectory = '')
 
     if (-not $Data -or @($Data).Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show('Aktarilacak veri yok.', 'Bilgi') | Out-Null
         return
     }
-
     $sfd = New-Object System.Windows.Forms.SaveFileDialog
     $sfd.Filter = 'CSV Dosyasi (*.csv)|*.csv'
     $sfd.FileName = "$DefaultFileName.csv"
@@ -1918,14 +2009,11 @@ function Export-GridToCsv {
     }
     if ($sfd.ShowDialog() -ne 'OK') { return }
 
-    try {
-        $Data | Export-Csv -Path $sfd.FileName -NoTypeInformation -Encoding UTF8 -Delimiter ';'
-    }
+    try { Write-FastCsv -Path $sfd.FileName -Header @($Data[0].PSObject.Properties.Name) -Rows $Data }
     catch {
         [System.Windows.Forms.MessageBox]::Show("CSV yazilamadi: $($_.Exception.Message)", 'Hata') | Out-Null
         return
     }
-
     if ($OpenAfter) {
         try { Invoke-Item -Path $sfd.FileName }
         catch { [System.Windows.Forms.MessageBox]::Show("CSV olusturuldu ancak otomatik acilamadi:`n$($sfd.FileName)", 'Bilgi') | Out-Null }
@@ -2173,6 +2261,7 @@ function Update-ParserFromCheck {
 
     Set-ParserCheckValues -HostName $Key -Values (ConvertTo-ParserCheckValues -Check $c)
     Set-ParserSvcState -Check $c
+    Set-SccmColumns -Panel 2 -Hostname $Key
     $d = "Kontrol: DNS=$($c.DnsStatus); Online=$($c.OnlineText); AD=$($c.AdStatus); LastLogon=$($c.LastLogon); Calisan=$($c.Running); Calismayan=$($c.NotRunning); CcmExec=$($c.CcmExec); SCCM kaydi=$($c.SccmKayit)"
     if ($c.Note) { $d += "`r`nNot: $($c.Note)" }
     Add-ParserDetail -Hostname $Key -Text $d
@@ -2208,6 +2297,7 @@ function Update-ParserFromScript {
 
     Set-ParserCheckValues -HostName $hn -Values (ConvertTo-ParserCheckValues -Check $chk)
     Set-ParserSvcState -Check $chk
+    Set-SccmColumns -Panel 2 -Hostname $hn
 
     $d = "$($r.Action): $($r.Result)`r`nDNS=$($chk.DnsStatus); Online=$($chk.OnlineText); AD=$($chk.AdStatus); LastLogon=$($chk.LastLogon); Calisan=$($chk.Running); Calismayan=$($chk.NotRunning); CcmExec=$($chk.CcmExec); SCCM kaydi=$($chk.SccmKayit)"
     if ($chk.Note) { $d += "`r`nNot: $($chk.Note)" }
@@ -2263,14 +2353,14 @@ function Start-ParserChecks {
 # ---------- Hedef secimi ----------
 
 function Get-ComputerList {
-    $raw = @($txtComputers.Text -split '[\r\n,;\s]+' | Where-Object { $_ })
-    $valid = @()
-    $bad = @()
-    foreach ($n in $raw) {
-        if ($n -match $script:HostRegex) {   # Turkce karakterler dahil; Panel 1 ve 2 ayni kural
-            if ($valid -notcontains $n) { $valid += $n }
-        }
-        else { $bad += $n }
+    # Soldaki kutudaki gecerli, tekil adlar (sira korunur). List + HashSet: binlerce satirda da O(n).
+    $valid = New-Object 'System.Collections.Generic.List[string]'
+    $bad   = New-Object 'System.Collections.Generic.List[string]'
+    $seen  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($n in ($txtComputers.Text -split '[\r\n,;\s]+')) {
+        if (-not $n) { continue }
+        if ($n -match $script:HostRegex) { if ($seen.Add($n)) { $valid.Add($n) } }   # Turkce karakterler dahil; Panel 1 ve 2 ayni kural
+        else { $bad.Add($n) }
     }
     if ($bad.Count -gt 0) {
         [System.Windows.Forms.MessageBox]::Show("Gecersiz bilgisayar isimleri yok sayildi:`n$($bad -join ', ')", 'Uyari') | Out-Null
@@ -2279,7 +2369,7 @@ function Get-ComputerList {
         [System.Windows.Forms.MessageBox]::Show('En az bir gecerli bilgisayar ismi girin.', 'Uyari') | Out-Null
         return @()
     }
-    return $valid
+    return $valid.ToArray()
 }
 
 function Get-TargetHosts {
@@ -2430,8 +2520,19 @@ function Start-SccmPrefetch {
     if (-not $script:RunTimer.Enabled) { $script:RunTimer.Start() }
 }
 
+function Set-SccmColumns {
+    # Boundary Group(s) / Operating System Build kolonlarini son toplu SCCM sorgusundan ($script:SccmExtra) doldurur.
+    param([int]$Panel, [string]$Hostname)
+    $v = $script:SccmExtra[(($Hostname -split '\.')[0])]
+    if (-not $v) { return }
+    if ($Panel -eq 2) { Set-ParserCheckValues -HostName $Hostname -Values @{ Boundary_Groups = $v[0]; OS_Build = $v[1] } }
+    elseif ($script:ResultsTable.Rows.Find($Hostname)) { Set-GridValues -Hostname $Hostname -Values @{ BoundaryGroups = $v[0]; OsBuild = $v[1] } }
+}
+
 function Update-Prefetch {
-    # RunTimer'dan: biten on-alma isinin sonucunu islere dagitip asil isi baslatir.
+    # RunTimer'dan: biten on-alma isinin sonucunu islere dagitip asil isi baslatir. Boundary Group(s) / OS Build
+    # kolonlari burada (UI thread'inde) hemen doldurulur ve $script:SccmExtra'da saklanir (Panel 2 satirlari yeniden
+    # kurulunca tekrar uygulanir).
     foreach ($pf in @($script:Prefetch)) {
         if (-not $pf.Job.Async.IsCompleted) { continue }
         [void]$script:Prefetch.Remove($pf)
@@ -2439,10 +2540,15 @@ function Update-Prefetch {
         $map = @($r.Out | Where-Object { $_ -is [hashtable] })[0]
         foreach ($it in $pf.Items) {   # kayit yoksa SccmInfo verilmez: worker eskisi gibi cihaz basina sorgular
             $k = (([string]$it.Key -split '\.')[0])
-            if ($map -and $map.ContainsKey($k)) { $it.Params['SccmInfo'] = $map[$k] }
+            if ($map -and $map.ContainsKey($k)) {
+                $it.Params['SccmInfo'] = $map[$k]
+                $script:SccmExtra[$k] = [string[]]@([string]$map[$k].BoundaryGroups, [string]$map[$k].OsBuild)
+            }
+            Set-SccmColumns -Panel $pf.Panel -Hostname ([string]$it.Key)
         }
         $a = $pf.RunArgs
-        Start-ParallelRun @a -Items $pf.Items
+        if ($a.Worker) { Start-ParallelRun @a -Items $pf.Items }
+        else { Set-UiBusy -Panel $pf.Panel -Busy $false }   # sadece SCCM bilgisi istendi
     }
 }
 
@@ -2614,6 +2720,7 @@ function Invoke-AutoRefresh {
 
 function Start-Check {
     # Panel 1 "Kontrol": -Reset ile tablo bastan kurulur (Kontrol Et), aksi halde satirlar yerinde guncellenir (otomatik yenileme).
+    # Boundary Group(s) / OS Build icin once toplu SCCM sorgusu (SCCM'e bagliysa).
     param([string[]]$Hosts, [string[]]$Services, [switch]$Reset)
     if ($Reset) {
         $script:ResultsTable.Rows.Clear()
@@ -2623,7 +2730,7 @@ function Start-Check {
     $items = @(foreach ($h in $Hosts) { [pscustomobject]@{ Key = $h; Params = @{ ComputerName = $h; ServiceNames = $Services } } })
     Set-GridPending -Hosts $Hosts -ClearError -Columns @('DnsStatus', 'IsOnline', 'AdStatus', 'LastLogon', 'Running', 'NotRunning', 'CcmExec')
     if ($Reset) { try { $dgv.ClearSelection(); $dgv.CurrentCell = $null } catch { } }   # otomatik secilen ilk satir hedefi daraltmasin
-    Start-ParallelRun -Title 'Kontrol' -Worker $script:CheckWorker -Items $items -OnResultFn 'Update-GridFromCheck'
+    Start-SccmPrefetch -Panel 1 -Items $items -RunArgs @{ Title = 'Kontrol'; Worker = $script:CheckWorker; OnResultFn = 'Update-GridFromCheck'; Panel = 1 }
 }
 
 # ---------- V14: Islem kaydi (denetim log) goruntuleyici ----------
@@ -2784,8 +2891,9 @@ function Show-FixResultDialog {
         $sfd.FileName = "ServisBaslatmaRaporu_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
         if ($sfd.ShowDialog() -ne 'OK') { return }
         try {
-            $script:ReportData | ForEach-Object { [pscustomobject]@{ Hostname = $_.Hostname; Status = (Protect-CellText $_.Status); Ayrinti = (Protect-CellText $_.Ayrinti) } } |
-                Export-Csv -Path $sfd.FileName -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+            # Not: string[] pipeline'dan gecerse acilir; bu yuzden nesne olarak verilir
+            Write-FastCsv -Path $sfd.FileName -Header @('Hostname', 'Status', 'Ayrinti') -Rows @($script:ReportData | ForEach-Object {
+                    [pscustomobject]@{ Hostname = $_.Hostname; Status = (Protect-CellText $_.Status); Ayrinti = (Protect-CellText $_.Ayrinti) } })
             [System.Windows.Forms.MessageBox]::Show("Disa aktarildi: $($sfd.FileName)", 'Bilgi') | Out-Null
         }
         catch { [System.Windows.Forms.MessageBox]::Show("CSV yazilamadi: $($_.Exception.Message)", 'Hata') | Out-Null }
@@ -2943,13 +3051,13 @@ function Get-SelectedRowIndexes {
 function Get-SelectedHosts {
     # Secili hucrelerin bulundugu satirlardaki gecerli, tekil Hostname'ler
     param($Grid)
-    $seen = New-NameMap
-    $out = @()
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $out  = New-Object 'System.Collections.Generic.List[string]'
     foreach ($i in @($Grid.SelectedCells | ForEach-Object { $_.RowIndex } | Sort-Object -Unique)) {
         $h = [string]$Grid.Rows[$i].Cells['Hostname'].Value
-        if ($h -and $h -match $script:HostRegex -and -not $seen.ContainsKey($h)) { $seen[$h] = 1; $out += $h }
+        if ($h -and $h -match $script:HostRegex -and $seen.Add($h)) { $out.Add($h) }
     }
-    return $out
+    return $out.ToArray()
 }
 
 function Copy-GridData {
@@ -2959,9 +3067,10 @@ function Copy-GridData {
     switch ($Mode) {
         'Cells' { Copy-ToClipboard $Grid.GetClipboardContent() }
         'Rows' {
-            $lines = @(($cols | ForEach-Object { $_.HeaderText }) -join "`t")
+            $lines = New-Object 'System.Collections.Generic.List[string]'
+            $lines.Add((($cols | ForEach-Object { $_.HeaderText }) -join "`t"))
             foreach ($i in (Get-SelectedRowIndexes $Grid)) {
-                $lines += (($cols | ForEach-Object { ([string]$Grid.Rows[$i].Cells[$_.Index].Value) -replace '[\t\r\n]+', ' ' }) -join "`t")
+                $lines.Add((($cols | ForEach-Object { ([string]$Grid.Rows[$i].Cells[$_.Index].Value) -replace '[\t\r\n]+', ' ' }) -join "`t"))
             }
             if ($lines.Count -gt 1) { Copy-ToClipboard ($lines -join "`r`n") }
         }
@@ -3046,6 +3155,8 @@ $dgv.Columns.AddRange([System.Windows.Forms.DataGridViewColumn[]]@(
     (New-GridColumn 'Running'      'Calisan Servisler'     10),
     (New-GridColumn 'NotRunning'   'Calismayan Servisler'  11),
     (New-GridColumn 'CcmExec'      'CcmExec'                7),
+    (New-GridColumn 'BoundaryGroups' 'Boundary Group(s)'   11),
+    (New-GridColumn 'OsBuild'      'Operating System Build' 9),
     (New-GridColumn 'LastAction'   'Son Islem'             13),
     (New-GridColumn 'ActionResult' 'Islem Sonucu / Script Ciktisi' 30),
     (New-GridColumn 'ErrorMessage' 'Hata / Not'            14),
@@ -3139,6 +3250,8 @@ $dgvParse.AutoSizeColumnsMode = 'None'
 foreach ($cn in $script:ParserColumns) { [void]$dgvParse.Columns.Add((New-GridColumn $cn $cn 10 $true $(if ($cn -eq 'UpdateName') { 300 } else { 130 }))) }
 $w2 = @{ SCCM_Kayit = 200; DNS_Durumu = 150; AD_LastLogon = 130; Calisan_Servisler = 180; Calismayan_Servisler = 200 }
 foreach ($cn in $script:ParserCheckColumns) { [void]$dgvParse.Columns.Add((New-GridColumn $cn $cn 10 $true $(if ($w2.ContainsKey($cn)) { $w2[$cn] } else { 120 }))) }
+[void]$dgvParse.Columns.Add((New-GridColumn 'Boundary_Groups' 'Boundary Group(s)' 10 $true 200))
+[void]$dgvParse.Columns.Add((New-GridColumn 'OS_Build' 'Operating System Build' 10 $true 150))
 [void]$dgvParse.Columns.Add((New-GridColumn 'KolonUyumu' 'KolonUyumu' 10 $true 170))
 [void]$dgvParse.Columns.Add((New-GridColumn 'SourceHost' 'SourceHost' 10 $false))
 [void]$dgvParse.Columns.Add((New-GridColumn 'Durum' 'Durum' 10 $false))
@@ -3555,7 +3668,7 @@ $btnCsv2.Add_Click({
 
     $fullPath = Join-Path $folder ("{0}.csv" -f (Get-ExportStamp))
     $data = Get-GridExportData -Grid $dgvParse -Source $script:ParseBinding -SkipColumns @('KolonUyumu')
-    try { $data | Export-Csv -Path $fullPath -NoTypeInformation -Encoding UTF8 -Delimiter ';' -Force }
+    try { Write-FastCsv -Path $fullPath -Header @($data[0].PSObject.Properties.Name) -Rows $data }
     catch {
         $lblParserStatus.Text = "CSV yazilamadi: $($_.Exception.Message)"
         return
@@ -3624,10 +3737,11 @@ $btnParseRecheck.Add_Click({
     $src = 'secili satirlar'
     if ($hostsToCheck.Count -eq 0) {
         $src = 'tablodaki tum cihazlar'
-        foreach ($row in $script:ParseTable.Rows) {
+        $seen = New-NameMap
+        $hostsToCheck = @(foreach ($row in $script:ParseTable.Rows) {
             $h = [string]$row['Hostname']
-            if ($h -and ($h -match $script:HostRegex) -and ($hostsToCheck -notcontains $h)) { $hostsToCheck += $h }
-        }
+            if ($h -and ($h -match $script:HostRegex) -and -not $seen.ContainsKey($h)) { $seen[$h] = 1; $h }
+        })
     }
     if ($hostsToCheck.Count -eq 0) {
         $lblParserStatus.ForeColor = [System.Drawing.Color]::DarkRed
