@@ -376,16 +376,22 @@ function Read-FastCsv {
     # burada satirlar dogrudan string[] olarak okunur. Bicim: ';' ayracli, alanlar "..." icinde ("" = "), ilk satir baslik
     # (Export-Csv ve Write-FastCsv ciktisi). Tirnaksiz satirlar ';' ile bolunur. Doner: Header (string[]), Rows (List[string[]])
     param([string]$Path)
+    # Ayrac (';' veya ',') baslik satirindan otomatik bulunur; Export-Csv'nin '#TYPE' satiri atlanir.
     $rows = New-Object 'System.Collections.Generic.List[string[]]'
     $header = $null
+    $d = ';'
     $sep = [string[]]@('";"')
     foreach ($line in [System.IO.File]::ReadLines($Path, [System.Text.Encoding]::UTF8)) {
         if ($line.Length -eq 0) { continue }
+        if ($null -eq $header) {
+            if ($line.StartsWith('#TYPE')) { continue }
+            if ($line.IndexOf('";"') -lt 0 -and ($line.IndexOf('","') -ge 0 -or ($line.IndexOf(';') -lt 0 -and $line.IndexOf(',') -ge 0))) { $d = ','; $sep = [string[]]@('","') }
+        }
         if ($line.Length -ge 2 -and $line[0] -eq '"' -and $line[$line.Length - 1] -eq '"') {
             $f = $line.Substring(1, $line.Length - 2).Split($sep, [System.StringSplitOptions]::None)
             for ($i = 0; $i -lt $f.Length; $i++) { if ($f[$i].IndexOf('""') -ge 0) { $f[$i] = $f[$i].Replace('""', '"') } }
         }
-        else { $f = $line.Split(';') }
+        else { $f = $line.Split($d) }
         if ($null -eq $header) { $header = $f } else { $rows.Add($f) }
     }
     return [pscustomobject]@{ Header = $header; Rows = $rows }
@@ -501,8 +507,8 @@ function Get-AdCacheIndex {
 
 function Get-AdOuComputers {
     # Bir domain'in OU'larini (alt OU'lar dahil) AD'den okur ve HER OU'yu ayri CSV'ye DOGRUDAN yazar:
-    #   $data = Get-ADComputer ... ; $data | Select-Object Name, Enabled, LastLogonTimestamp, DistinguishedName | Export-Csv
-    # Satir satir donusum YOK (LastLogon / domain okurken cevrilir). Dosya once .tmp'ye yazilir, basariliysa yerine tasinir;
+    #   $data = Get-ADComputer ... ; $data | Export-Csv      (Select-Object / donusum YOK - veri oldugu gibi yazilir)
+    # Gereken her sey (LastLogon tarihi, domain) OKURKEN ve sadece bakilan makine icin yapilir. Dosya once .tmp'ye yazilir, basariliysa yerine tasinir;
     # hata veren OU'nun ESKI dosyasina dokunulmaz (eski veri kendiliginden korunur).
     # LIMIT YOK: -ResultSetSize $null; -ResultPageSize 1000 sadece sayfa boyutu.
     # Ilerleme: $Progress["$Domain [$OU]"] = @(sayi, durum, sn) - durum: okunuyor / yaziliyor / bitti / hata
@@ -529,11 +535,8 @@ function Get-AdOuComputers {
 
             $file = Join-Path $CacheDir (Get-AdCacheFileName -Domain $Domain -OU $sb)
             $tmp  = "$file.tmp"
-            if ($data.Count -gt 0) {
-                $data | Select-Object Name, Enabled, LastLogonTimestamp, DistinguishedName |
-                    Export-Csv -LiteralPath $tmp -NoTypeInformation -Delimiter ';' -Encoding UTF8 -ErrorAction Stop
-            }
-            else { Set-Content -LiteralPath $tmp -Value '"Name";"Enabled";"LastLogonTimestamp";"DistinguishedName"' -Encoding UTF8 -ErrorAction Stop }
+            if ($data.Count -gt 0) { $data | Export-Csv -LiteralPath $tmp -NoTypeInformation -Encoding UTF8 -ErrorAction Stop }   # olduğu gibi
+            else { Set-Content -LiteralPath $tmp -Value '"Name","Enabled","LastLogonTimestamp","DistinguishedName"' -Encoding UTF8 -ErrorAction Stop }
             # Okuyan bir runspace dosyayi o an acik tutuyorsa tasima basarisiz olabilir: birkac kez dene
             for ($try = 1; ; $try++) {
                 try { Move-Item -LiteralPath $tmp -Destination $file -Force -ErrorAction Stop; break }
