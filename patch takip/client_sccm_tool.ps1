@@ -296,6 +296,18 @@ function Resolve-HostDns {
     }
 }
 
+function Test-PingOnly {
+    # "Sadece ping" listesi (1. bolum): AD / WMI guveni olmayan (or. SCCM trust var, AD trust yok) cihazlar.
+    # Desenler -like ile (* ve ?), virgul / noktali virgul / bosluk ile ayrilir; tam ad VEYA kisa ad eslesirse $true.
+    # Liste worker'larda da okunabilsin diye process ortam degiskeninde: $env:CLIENTTOOL_PINGONLY
+    param([string]$ComputerName)
+    $p = [string]$env:CLIENTTOOL_PINGONLY
+    if (-not $p) { return $false }
+    $short = ($ComputerName -split '\.')[0]
+    foreach ($x in ($p -split '[,;\s]+')) { if ($x -and ($ComputerName -like $x -or $short -like $x)) { return $true } }
+    return $false
+}
+
 function Get-HostReach {
     # DNS + ping + KIMLIK DOGRULAMA.
     # Sorun: VPN'e baglanmis bir makinenin DNS kaydi eski IP'de kalir; o IP baska bir cihaza verildiginde ping
@@ -318,6 +330,13 @@ function Get-HostReach {
 
     $alive = @($dns.Ips | Where-Object { Test-Ping -Address $_ })
     if ($alive.Count -eq 0) { $r.Note = 'Makine yanit vermiyor (ping basarisiz)'; return $r }
+
+    # "Sadece ping" listesindeki cihaz: ping var -> cevrimici (NetBIOS / WMI kimlik dogrulamasi YAPILMAZ)
+    if (Test-PingOnly -ComputerName $ComputerName) {
+        $r.Ip = $alive[0]; $r.Online = $true; $r.Identity = 'Muaf'; $r.OnlineText = 'Evet (sadece ping)'
+        $r.Note = 'Sadece ping listesinde: kimlik (NetBIOS / WMI) ve servis kontrolu yapilmadi.'
+        return $r
+    }
 
     # 1) NetBIOS: ping veren her IP icin cihazin gercek adi
     $wrong = @()
@@ -418,6 +437,10 @@ function Get-ServiceCheck {
     param([string]$ComputerName, [string[]]$ServiceNames = @())
 
     $r = [pscustomobject]@{ Running = ''; NotRunning = ''; CcmExec = ''; ServiceDetail = @(); Note = '' }
+    if (Test-PingOnly -ComputerName $ComputerName) {   # WMI / RPC yetkisi yok: servis sorgulanmaz
+        $r.Running = $r.NotRunning = $r.CcmExec = 'Kontrol edilmedi (sadece ping)'
+        return $r
+    }
     $map = $null
     try {
         $all = [System.ServiceProcess.ServiceController]::GetServices($ComputerName)
@@ -460,7 +483,7 @@ function Get-RemoteStatus {
         $svc = Get-ServiceCheck -ComputerName $ComputerName -ServiceNames $ServiceNames
         $row.Running = $svc.Running; $row.NotRunning = $svc.NotRunning; $row.CcmExec = $svc.CcmExec; $row.ServiceDetail = $svc.ServiceDetail
         if ($svc.Note) { $errs += $svc.Note }
-        $row.State = if ($row.NotRunning -or $row.CcmExec -eq 'Yok' -or $reach.Identity -ne 'Dogrulandi') { 'warn' } else { 'ok' }
+        $row.State = if ($reach.Identity -eq 'Muaf') { 'ok' } elseif ($row.NotRunning -or $row.CcmExec -eq 'Yok' -or $reach.Identity -ne 'Dogrulandi') { 'warn' } else { 'ok' }
     }
     $row.ErrorMessage = ($errs -join ' | ')
     return $row
@@ -573,8 +596,9 @@ function Get-NoResponseVerdict {
     if (-not $reach.DnsOk)  { return [pscustomobject]@{ State = 'fail'; Text = "Cevrimdisi oldugu icin script calismadi (DNS: $($reach.DnsText))." } }
     if (-not $reach.Online) { return [pscustomobject]@{ State = 'fail'; Text = "Cevrimdisi oldugu icin script calismadi. $($reach.Note)" } }
 
+    $pre = if ($reach.Identity -eq 'Dogrulandi') { 'Cevrimici' } elseif ($reach.Identity -eq 'Muaf') { 'Ping var (sadece ping)' } else { 'Ping var (kimlik dogrulanamadi)' }
+    if ($reach.Identity -eq 'Muaf') { return [pscustomobject]@{ State = 'warn'; Text = "$pre - script calismadi ($TimeoutSec sn icinde SCCM'den yanit gelmedi)." } }
     $cc = (Get-ServiceCheck -ComputerName $ComputerName).CcmExec
-    $pre = if ($reach.Identity -eq 'Dogrulandi') { 'Cevrimici' } else { 'Ping var (kimlik dogrulanamadi)' }
     if ($cc -eq 'Yok')         { return [pscustomobject]@{ State = 'fail'; Text = 'SCCM ajani bulunmuyor (CcmExec servisi yok).' } }
     if ($cc -eq 'Erisilemedi') { return [pscustomobject]@{ State = 'warn'; Text = "$pre - script calismadi (CcmExec sorgulanamadi)." } }
     if ($cc -ne 'Running')     { return [pscustomobject]@{ State = 'warn'; Text = "$pre - script calismadi (CcmExec servisi $cc)." } }
@@ -785,7 +809,7 @@ function Get-AdStructureStatus {
     param([string]$ComputerName)
 
     $reach = Get-HostReach -ComputerName $ComputerName
-    $state = if (-not $reach.Online) { 'fail' } elseif ($reach.Identity -ne 'Dogrulandi') { 'warn' } else { 'ok' }
+    $state = if (-not $reach.Online) { 'fail' } elseif ($reach.Identity -notin 'Dogrulandi', 'Muaf') { 'warn' } else { 'ok' }
     return [pscustomobject]@{
         Hostname = $ComputerName; DnsStatus = $reach.DnsText; IsOnline = $reach.Online; OnlineText = $reach.OnlineText
         Identity = $reach.Identity; AdStatus = ''; LastLogon = ''
@@ -887,7 +911,7 @@ function New-WorkerScript {
     # Ortak fonksiyonlarin kaynak kodunu worker scriptinin basina gomer; tanimlar TEK yerde tutulur.
     param([string]$ParamLine, [string]$CallLine, [string[]]$Funcs)
     $all = @('ConvertTo-WqlString', 'Get-ErrText', 'Test-Ping', 'Test-TcpPort', 'Get-NetBiosName', 'Get-WmiFailureReason', 'Get-WmiComputerName',
-        'Get-DnsWildcardIps', 'Resolve-HostDns', 'Get-HostReach', 'Get-AdComputerInfo', 'Get-ServiceCheck',
+        'Get-DnsWildcardIps', 'Test-PingOnly', 'Resolve-HostDns', 'Get-HostReach', 'Get-AdComputerInfo', 'Get-ServiceCheck',
         'Get-RemoteStatus', 'Start-RemoteFix', 'Invoke-SccmClientAction', 'Get-NoResponseVerdict', 'Get-SccmDevice', 'Send-SccmScript',
         'Get-AdStructureStatus', 'New-SkippedScript', 'Invoke-ScriptWithAdCheck', 'Get-SccmRegistration', 'Get-ParserHostCheck', 'Invoke-ParserScriptRun')
     $defs = foreach ($n in $(if ($Funcs) { $Funcs } else { $all })) { "function $n {`n$((Get-Item -Path "function:$n").ScriptBlock.ToString())`n}" }
@@ -1418,7 +1442,7 @@ function Update-GridFromScript {
 
     # Servis sorunu varsa (calismayan servis / CcmExec yok) satir en az 'warn' olur
     $state = $r.State
-    if ($state -eq 'ok' -and ($r.NotRunning -or $r.CcmExec -eq 'Yok')) { $state = 'warn' }
+    if ($state -eq 'ok' -and (($r.NotRunning -and $r.NotRunning -notlike 'Kontrol edil*') -or $r.CcmExec -eq 'Yok')) { $state = 'warn' }
 
     # Makineye ulasilamadiysa servis kolonlari bos kalmasin
     $un = (-not $r.IsOnline)
@@ -2462,7 +2486,7 @@ function Get-ParserRowState {
     $on = [string]$Row['Online_mi']; $dns = [string]$Row['DNS_Durumu']; $ku = [string]$Row['KolonUyumu']
     if ($on -like 'Hayir*' -or $dns -match '^(No such host|DNS hatasi|Islem hatasi|Iptal edildi)' -or $ku -eq 'Cikti yok') { return 'fail' }
     $nr = [string]$Row['Calismayan_Servisler']; $cc = [string]$Row['CcmExec_Durumu']; $ad = [string]$Row['AD_Durumu']; $sk = [string]$Row['SCCM_Kayit']
-    if ($ku -notlike 'OK*' -or ($nr -and $nr -notlike 'Kontrol edilemedi*') -or ($cc -and $cc -ne 'Running') -or ($ad -and $ad -ne 'Enabled') -or
+    if ($ku -notlike 'OK*' -or ($nr -and $nr -notlike 'Kontrol edil*') -or ($cc -and $cc -ne 'Running' -and $cc -notlike 'Kontrol edilmedi*') -or ($ad -and $ad -ne 'Enabled') -or
         $on -eq 'Evet (dogrulanamadi)' -or $sk -like 'SCCM de kayitli degil*' -or $sk -like 'Kayit var*') { return 'warn' }
     return 'ok'
 }
@@ -2817,8 +2841,10 @@ $btnAd       = New-Ctl Button 'AD Yapisi Kontrolu' 130 78 150 32
 $btnFix      = New-Ctl Button 'Servisleri Baslat' 290 78 150 32 @{ Enabled = $false }
 $btnAdCache  = New-Ctl Button 'AD Verisi...' 10 122 165 26
 $lblAdCache  = New-Ctl Label 'Onbellek: -' 182 128 328 18 $gray
-$lblAdHint   = New-Ctl Label 'AD bilgisi bellekteki AD verisinden okunur; Online = ping + cihaz adi dogrulamasi.' 10 158 500 16 $gray
-$gbCheck.Controls.AddRange(@($lblServices, $txtServices, $btnCheck, $btnAd, $btnFix, $btnAdCache, $lblAdCache, $lblAdHint))
+$lblPingOnly = New-Ctl Label 'Sadece ping:' 10 158
+$txtPingOnly = New-Ctl TextBox '' 85 154 420 23
+$txtPingOnly.Add_TextChanged({ $env:CLIENTTOOL_PINGONLY = $txtPingOnly.Text })   # worker'lar da okur
+$gbCheck.Controls.AddRange(@($lblServices, $txtServices, $btnCheck, $btnAd, $btnFix, $btnAdCache, $lblAdCache, $lblPingOnly, $txtPingOnly))
 
 # ---------- 2) SCCM Script ----------
 $gbSccm        = New-Ctl GroupBox '2) SCCM Script' 750 8 580 184
@@ -3126,7 +3152,7 @@ $dgvParse.add_CellFormatting({
             elseif ($v -and $v -notlike 'Bekleniyor*') { $e.CellStyle.BackColor = $grn }
         }
         'Online_mi' {
-            if ($v -eq 'Evet') { $e.CellStyle.BackColor = $grn }
+            if ($v -like 'Evet*') { $e.CellStyle.BackColor = $grn }
             elseif ($v -like 'Hayir*') { $e.CellStyle.BackColor = $red }
             elseif ($v) { $e.CellStyle.BackColor = $yel }
         }
@@ -3136,7 +3162,7 @@ $dgvParse.add_CellFormatting({
             elseif ($v) { $e.CellStyle.BackColor = $yel }
         }
         'Calismayan_Servisler' {
-            if ($v -and $v -notlike 'Kontrol edilemedi*' -and $v -notlike 'Bekleniyor*') { $e.CellStyle.BackColor = $red }
+            if ($v -and $v -notlike 'Kontrol edil*' -and $v -notlike 'Bekleniyor*') { $e.CellStyle.BackColor = $red }
         }
         'CcmExec_Durumu' {
             if ($v -eq 'Running') { $e.CellStyle.BackColor = $grn }
@@ -3209,6 +3235,8 @@ foreach ($p in 1, 2) {
     $tip.SetToolTip($script:Auto[$p].Check, $(if ($p -eq 1) { 'Secilen araliklarla tablodaki tum cihazlar icin Kontrol (DNS / Online / AD / servis) tekrarlanir. Tablo silinmez.' } else { 'Secilen araliklarla tablodaki tum cihazlar icin DNS / AD / servis / SCCM kontrolu tekrarlanir. Script tekrar GONDERILMEZ.' }))
     foreach ($k in 'ok', 'warn', 'fail', 'pending', 'all') { $tip.SetToolTip($script:SumButtons[$p][$k], 'Tikla: tabloyu bu duruma filtrele (tekrar tikla / Tumu: filtreyi kaldir). Metin filtresiyle birlikte calisir.') }
 }
+$tip.SetToolTip($txtPingOnly, "AD / WMI yetkisi olmayan cihazlar (or. sadece SCCM trust olan domain). Desenler: * ve ? (-like), virgul ile ayirin. Ornek: *.diger.local, DMZ-*, SUBE?-PC*`nEslesen cihaz: ping varsa CEVRIMICI kabul edilir, NetBIOS / WMI kimlik ve servis kontrolu yapilmaz, SCCM scripti gonderilir.")
+$tip.SetToolTip($lblPingOnly, $tip.GetToolTip($txtPingOnly))
 $tip.SetToolTip($btnCheck, "Online mi: Evet = ping + cihaz adi dogrulandi | Hayir (IP baska cihazda) = DNS kaydi eski, IP'yi baska cihaz kullaniyor | Hayir (ping var, cihaz dogrulanamadi) = cevap veren cihazin adi okunamadi (gateway / joker DNS olabilir).")
 
 # ==================== UI DURUM YONETIMI ====================
@@ -3260,6 +3288,7 @@ function Import-Settings {
             if ($t -ge $nudTimeout.Minimum -and $t -le $nudTimeout.Maximum) { $nudTimeout.Value = $t }
         }
         if ($s.ParserFolder) { $txtPath2.Text = [string]$s.ParserFolder }
+        if ($null -ne $s.PingOnly) { $txtPingOnly.Text = [string]$s.PingOnly }
         if ($null -ne $s.ParserCheck) { $chkParseCheck.Checked = [bool]$s.ParserCheck }
         if ($s.LastScriptGuid) { $script:PendingScriptGuid = [string]$s.LastScriptGuid }
         if ($null -ne $s.AdCacheSources) {   # AD onbellegi domain / OU eslemesi
@@ -3283,6 +3312,7 @@ function Save-Settings {
             Services       = $txtServices.Text.Trim()
             Timeout        = [int]$nudTimeout.Value
             ParserFolder   = $txtPath2.Text.Trim()
+            PingOnly       = $txtPingOnly.Text.Trim()
             ParserCheck    = [bool]$chkParseCheck.Checked
             LastScriptGuid = $guid
             AdCacheSources = @($script:AdCacheSources | ForEach-Object { [pscustomobject]@{ Domain = [string]$_.Domain; OU = [string]$_.OU } })
