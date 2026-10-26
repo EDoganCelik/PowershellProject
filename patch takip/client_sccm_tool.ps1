@@ -4,409 +4,203 @@
     Istemci Durum ve SCCM Islem Araci (WinForms GUI)
 
 .ACIKLAMA
-    Sol textbox: Bilgisayar isimleri (her satira bir tane).
+    Sol textbox: bilgisayar isimleri (her satira bir tane).
 
-    "Kontrol Et" her makine icin sunlari getirir:
-      - DNS durumu (cozumlenemezse "No such host is known")
-      - Cevrimici durumu (ping)
-      - Active Directory: hesap durumu (Enabled / Disabled / Bulunamadi) ve Last Logon
-      - Istenen servislerin durumu + CcmExec (SCCM ajani) durumu
+    1) Kontrol Et      : DNS, Cevrimici (ping + KIMLIK DOGRULAMA), AD (onbellekten), servisler + CcmExec.
+       Servisleri Baslat: durdurulmus servisleri baslatir.  AD Yapisi Kontrolu: DNS + ping + AD (servissiz).
+    2) SCCM Script     : SMS Provider'daki ONAYLI scripti hedeflerde calistirir, sonucu bekler. Cevap gelmezse sebep
+                         (cevrimdisi / IP baska cihazda / SCCM ajani yok / cevrimici ama calismadi) yazilir.
+    3) SCCM Istemci Eylemi: Machine Policy, Update Scan/Deployment, App Deployment, HW/SW Inventory, DDR tetikler.
+       Hedef: gridde secili hucrelerin satirlari; secim yoksa soldaki listedeki tum makineler.
 
-    "Servisleri Baslat" -> durdurulmus servisleri baslatir.
+    CEVRIMICI KONTROLU (sahte "online" onlemi): VPN'e baglanmis makinelerin DNS kaydi eski IP'de kalabilir; o IP
+    baska cihaza verilince ping cevap verir. Bu yuzden ping cevabi veren cihazin ADI okunur (NetBIOS node status,
+    yoksa WMI Win32_ComputerSystem) ve beklenen adla karsilastirilir:
+      Evet | Hayir | Hayir (IP baska cihazda: <ad>) | Hayir (ping var, cihaz dogrulanamadi: <IP>) -> sadece Evet'te uzak islem.
+      DNS "joker" cevaplari (olmayan ada gateway IP'si donmesi) kayit yok sayilir.
 
-    SCCM Istemci Eylemi (3. bolum): Machine Policy, Update Scan, Update Deployment
-    Evaluation, App Deployment Evaluation, Hardware/Software Inventory tetikler.
-    Hedef: gridde secili satirlar; secim yoksa soldaki listedeki tum makineler.
+    PANEL 1 - Script Ciktilari / Kontroller : DNS, Online, AD, Last Logon, servisler, script ciktisi (detay: cift tik).
+    PANEL 2 - Update Parser (Panel 1'den BAGIMSIZ): yapistirilan / Panel 2'den gonderilen script ciktisini ('@' ile
+              ayrilan kayitlar, ';' ile ayrilan kolonlar) alt alta kolonlara boler; her cihaz icin DNS, Online, AD,
+              SERVISLER (1. bolumdeki liste), CcmExec ve SCCM kaydi kontrol edilir. Filtre, Excel, CSV.
+    Tablolar: hucre secilebilir; Ctrl+C secili hucre(ler)i kopyalar, sag tik menusunde diger kopyalama secenekleri.
 
-    SCCM Script (2. bolum): SMS Provider'a baglanip ortamdaki scriptleri listeler,
-    secilen (ONAYLI) scripti hedef makinelerde calistirir ve sonucu bekler.
-    Cevap gelmezse sebep tespit edilir:
-      - SCCM'de ajan yok          -> "SCCM ajani bulunmuyor"
-      - Makine ping vermiyor      -> "Cevrimdisi oldugu icin script calismadi"
-      - Makine cevrimici          -> "Cevrimici - script calismadi"
+    AD ONBELLEGI: AD bilgisi diskteki CSV'den okunur (ServiceStatus\AdComputerCache.csv); "AD Onbellegi..." penceresinde
+    domain -> OU eslemesi girilir, "Kaydet ve Onbellegi Guncelle" ile OU'lar (alt OU dahil) AD'den taranir.
+    Onbellek sadece kullanici isterse guncellenir. Last Logon = lastLogonTimestamp (~14 gun gecikmeli).
 
-    SEKMELER (PANELLER):
-      Panel 1 - Script Ciktilari / Kontroller : DNS, Cevrimici, AD durumu, Last Logon, servis
-                durumlari ve SCCM script ciktisi (sadece cikti, exit code/OperationID vb. yok;
-                onlar satira cift tiklayinca Detay'da gorunur).
-      Panel 2 - Update Parser (Panel 1'den BAGIMSIZ) : kendi yapistirma kutusu, kendi script gonder /
-                kontrol butonlari, kendi tablosu ve kendi durum cubugu vardir; Panel 1'e hicbir sey yazmaz.
-                  * "Parse Et": SCCM Run Script ciktisi ('@' ile ayrilan makine kayitlari, satirlar ';' ile
-                    ayrilmis) alt alta kolonlara bolunur (client_update_parser.ps1 mantigi).
-                  * Parse sonrasi her cihaz icin DNS, Online, AD (Enabled/Disabled/Last Logon), CcmExec
-                    (SCCM ajan servisi) ve SCCM kaydi kontrol edilir; sonuc ekstra sutunlara yazilir.
-                  * "Script Gonder (Panel 2)": scripti dogrudan SCCM'den gonderir; cikti + kontroller
-                    SADECE Panel 2'ye yazilir (Panel 1'deki "Secili Scripti Gonder" ise SADECE Panel 1'e yazar).
-                  * Filtre, Excel ve "CSV Olustur ve Ac" (<gun-saat>-updates.csv, kayit klasoru secilebilir).
-      Ortak olanlar sadece ayarlardir: soldaki bilgisayar listesi, SMS Provider baglantisi / script secimi,
-      bekleme suresi ve "tum DC" secenegi. Sonuc tablolari ve istekler ayridir; tum isler tek havuzu
-      paylastigi icin toplamda yine en fazla 10 makineye ayni anda istek gider.
-
-    AD YAPISI KONTROLU: DNS + ping + AD (var mi / Enabled-Disabled / Last Logon).
-      - "SCCM Script" gonderilirken her makine icin otomatik calisir.
-      - "AD Yapisi Kontrolu" butonu ile script gondermeden tek basina da calistirilabilir.
-
-    SONUC TABLOSU: Islem baslayinca hedef makinelerin TUMU hemen tabloya eklenir; sonucu henuz
-    gelmeyen hucrelerde "Bekleniyor.." yazar, cevap geldikce ilgili satir yerinde guncellenir.
-    Ulasilamayan makinelerde "Ulasilamadi" ve sebebi (cevrimdisi, DNS, SCCM ajani yok vb.) yazilir.
-
-.PARALELLIK
-    Tum islemler RunspacePool ile paralel calisir; havuz SABIT 10 ile sinirlidir
-    (ayni anda en fazla 10 makineye istek gider). UI donmaz.
-
-.REMOTING YONTEMI
-    WinRM / Invoke-Command / PSSession KULLANILMAZ. Sadece RPC / DCOM / WMI:
-      - Servisler          : Get-Service -ComputerName / Start-Service
-      - SCCM istemci eylemi: WMI root\ccm : SMS_Client.TriggerSchedule
-      - SCCM script        : SMS Provider (root\SMS\site_XXX) SMS_Scripts,
-                             SMS_ClientOperation.InitiateClientOperationEx (Type 135),
-                             SMS_ScriptsExecutionStatus
-      - Active Directory   : RSAT ActiveDirectory modulu (Get-ADComputer / Get-ADDomainController)
-    SCCM konsolu veya ConfigurationManager modulu GEREKMEZ.
+.MIMARI
+    - WinRM / Invoke-Command / PSSession KULLANILMAZ. Sadece RPC / DCOM / WMI, ServiceController, NetBIOS (UDP 137).
+    - Internete cikmaz. Kimlik bilgisi sorulmaz: scripti calistiran kullanicinin yetkileri (Integrated Windows Auth).
+    - RunspacePool, SABIT en fazla 10 eszamanli hedef (Panel 1 + Panel 2 ortak). UI donmaz.
+    - SCCM konsolu / ConfigurationManager modulu GEREKMEZ.
 
 .GEREKSINIMLER
-    - Windows PowerShell 5.1 (PowerShell 7'de Get-WmiObject yoktur, calismaz)
-    - RSAT: Active Directory PowerShell modulu (ActiveDirectory) + DC'lere ADWS (TCP 9389) erisimi
-    - Hedef makinelerde yerel admin (servis + root\ccm icin), RPC/DCOM erisimi
-    - SCCM'de: scriptlerin ONAYLANMIS olmasi ve kullanicinin "Run Script"
-      yetkisinin bulunmasi (RBAC)
+    - Windows PowerShell 5.1, STA (gerekirse script kendini STA ile yeniden baslatir)
+    - RSAT ActiveDirectory modulu + ADWS (TCP 9389) -> sadece AD onbellegi guncellenirken
+    - Hedeflerde yerel admin (servis + root\ccm), RPC/DCOM erisimi; SCCM'de onayli script + "Run Script" yetkisi
 
-.KAYITLAR
-    C:\Users\<kullanici>\Desktop\ServiceStatus\ altinda:
-      - ClientToolSettings.json  : SMS Provider, servis listesi, bekleme suresi vb.
-      - ClientTool_yyyyMM.log    : SCCM eylem / script gonderimlerinin denetim kaydi
+.KAYITLAR  (%USERPROFILE%\Desktop\ServiceStatus\)
+    ClientToolSettings.json (ayarlar) | AdComputerCache.csv (AD onbellegi) | ClientTool_yyyyMM.log (denetim kaydi)
 #>
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.DirectoryServices
+# WinForms ve pano (Ctrl+C) STA ister; Get-WmiObject sadece Windows PowerShell 5.1'de var.
+if ($PSVersionTable.PSEdition -eq 'Core' -or [System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+    $winPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if ($PSCommandPath -and (Test-Path -LiteralPath $winPs)) {
+        Start-Process -FilePath $winPs -ArgumentList @('-NoProfile', '-STA', '-File', "`"$PSCommandPath`"")
+        return
+    }
+}
+
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing, System.ServiceProcess, System.Management
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # ==================== GLOBAL DEGISKENLER ====================
-$script:MaxParallel  = 10      # SABIT esik: ayni anda en fazla 10 makine
-$script:LastResults  = @()     # Son kontrol sonuclari (ServiceDetail dahil)
-$script:Details      = @{}     # Hostname -> satir detay/log metni
-$script:SmsServer    = ''
-$script:SiteCode     = ''
-$script:CmScripts    = @()
+function New-NameMap { return (New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)) }   # tr-TR'de I/i sorunu olmayan sozluk
+
+$script:MaxParallel    = 10           # SABIT esik: ayni anda en fazla 10 makine
+$script:LastResults    = New-NameMap  # Hostname -> son kontrol sonucu (IsOnline + ServiceDetail; "Servisleri Baslat" icin)
+$script:Details        = New-NameMap  # Panel 1: Hostname -> satir detay/log metni
+$script:ParserNoOutput = New-NameMap  # Panel 2: script'ten cikti gelmeyen hostlar
+$script:ParserDetails  = New-NameMap  # Panel 2: Hostname -> detay metni
+$script:SmsServer      = ''
+$script:SiteCode       = ''
+$script:CmScripts      = @()
 $script:PendingScriptGuid = ''
-$script:ParserNoOutput = @{}   # Panel 2: script'ten cikti gelmeyen hostlar
-$script:ParserDetails  = @{}   # Panel 2: Hostname -> detay metni (Panel 1'in $script:Details tablosu ile KARISMAZ)
-$script:ParsePasteSeq  = 0     # Panel 2: "Parse Et" sayaci (her yapistirma icin ayri SourceHost etiketi)
-$script:HostRegex      = '^[A-Za-z0-9][A-Za-z0-9._-]*$'
-$script:SharedPool     = $null # Panel 1 + Panel 2 islerinin ORTAK havuzu (toplamda en fazla 10 makine)
-$script:ActiveRuns     = New-Object System.Collections.ArrayList   # calisan paralel isler (panel bazli)
-$script:AllColsLabel = '(Tum kolonlar)'
+$script:ParsePasteSeq  = 0            # Panel 2: "Parse Et" sayaci (her yapistirma icin ayri SourceHost etiketi)
+$script:HostRegex      = '^[A-Za-z0-9İıŞşĞğÜüÖöÇç][A-Za-z0-9İıŞşĞğÜüÖöÇç._-]*$'   # Panel 1 + Panel 2 ortak
+$script:SharedPool     = $null        # Panel 1 + Panel 2 islerinin ORTAK havuzu
+$script:ActiveRuns     = New-Object System.Collections.ArrayList
+$script:AllColsLabel   = '(Tum kolonlar)'
+$script:PendingText    = 'Bekleniyor..'
+$script:CancelText     = '__IPTAL__'   # iptal edilen islerin sonuc isleyicilerine gecen isaret
+$script:CancelledJobs  = New-Object System.Collections.ArrayList   # iptal edilmis, uzak cagrisi bitmeyi bekleyen isler
+$script:ScriptPoll     = New-Object System.Collections.ArrayList   # gonderilmis, sonucu toplu yoklamayla beklenen scriptler
+$script:PollJob        = $null        # o an calisan toplu yoklama sorgusu (ayni anda en fazla 1)
+$script:PollRunspace   = $null        # yoklama icin ayri runspace (10'luk havuzu kullanmaz)
+$script:LastPoll       = [datetime]::MinValue
+$script:PollCount      = 0            # SMS Provider'a giden yoklama turu sayaci (durum cubugunda gosterilir)
+$script:PollError      = ''
+$script:DeferFlag      = $false
+$script:CurrentRun     = $null
+$script:Prefetch       = New-Object System.Collections.ArrayList   # V2: SCCM kaydi on-alma isleri
+$script:LastOp         = @{}          # V6: panel -> son islem (RunArgs + Items) "Basarisizlari Tekrar Dene" icin
+$script:StateFilter    = @{ 1 = ''; 2 = '' }   # V7: ozet cubugu durum filtresi
+$script:SumButtons     = @{}
+$script:RetryButtons   = @{}
+$script:SumDirty       = @{ 1 = $true; 2 = $true }
+$script:DirtyRows      = New-Object 'System.Collections.Generic.HashSet[object]'   # V7: Durum'u yeniden hesaplanacak Panel 2 satirlari
+$script:Auto           = @{}          # V13: panel -> otomatik yenileme ayarlari
+$script:ReportQueue    = New-Object System.Collections.ArrayList   # gosterilmeyi bekleyen servis baslatma raporlari
+$script:ShowingReport  = $false
+$script:ParserSvc      = New-NameMap  # Panel 2: Hostname -> son servis durumu (IsOnline + ServiceDetail; Panel 2 "Servisleri Baslat" icin)
+
+# AD ONBELLEGI domain / OU eslemesi (ClientToolSettings.json'da saklanir). OU = DistinguishedName (alt OU'lar dahil taranir)
+$script:AdCacheSources = @()
+$script:AdCacheNew     = New-NameMap  # guncelleme sirasinda: Domain -> worker sonucu
 $script:ParserDefaultFolder = Join-Path $env:USERPROFILE 'Desktop\SCCM-Raporlari'
 
-# Update Parser CSV basligi (21 kolon). Eski 19 kolonluk cikti (client_update_parser.ps1) da otomatik taninir.
-$script:ParserHeaderText = 'Hostname;UpdateName;EvalState;PercentComplete;ErrorCode;LastShutdownTime;IsBlueScreen;CBS_NTSTATUS_FROM_WIN32;CBS_STATUS_SXS_FILE_HASH_MISMATCH;UD_CERTIFICATE_ERROR_0x80010002;UD_DOWNLOAD_ERROR_0x80d02002;BuildVersion;SistemDrive_FreeGB;SistemDrive_FreePercent;Wuauserv_Durum;BITS_Durum;CryptSvc_Durum;TrustedInstaller_Durum;SoftwareDistribution_BoyutMB;DISM_CheckHealth;DTS_DP_IndirmeHatalari'
-$script:ParserColumns    = @($script:ParserHeaderText -split ';')
+# Update Parser basligi (21 kolon). Eski 19 kolonluk cikti (client_update_parser.ps1) kolon ADIYLA yerlestirilir.
+$script:ParserColumns = @('Hostname;UpdateName;EvalState;PercentComplete;ErrorCode;LastShutdownTime;IsBlueScreen;CBS_NTSTATUS_FROM_WIN32;CBS_STATUS_SXS_FILE_HASH_MISMATCH;UD_CERTIFICATE_ERROR_0x80010002;UD_DOWNLOAD_ERROR_0x80d02002;BuildVersion;SistemDrive_FreeGB;SistemDrive_FreePercent;Wuauserv_Durum;BITS_Durum;CryptSvc_Durum;TrustedInstaller_Durum;SoftwareDistribution_BoyutMB;DISM_CheckHealth;DTS_DP_IndirmeHatalari' -split ';')
+$script:ParserLegacyColumns = @($script:ParserColumns | Where-Object { $_ -ne 'SoftwareDistribution_BoyutMB' -and $_ -ne 'DTS_DP_IndirmeHatalari' })
 
-# Eski 19 kolonluk cikti (client_update_parser.ps1 basligi): satirda 19 alan gelirse kolonlar ADIYLA yerlestirilir
-$script:ParserLegacyHeaderText = 'Hostname;UpdateName;EvalState;PercentComplete;ErrorCode;LastShutdownTime;IsBlueScreen;CBS_NTSTATUS_FROM_WIN32;CBS_STATUS_SXS_FILE_HASH_MISMATCH;UD_CERTIFICATE_ERROR_0x80010002;UD_DOWNLOAD_ERROR_0x80d02002;BuildVersion;SistemDrive_FreeGB;SistemDrive_FreePercent;Wuauserv_Durum;BITS_Durum;CryptSvc_Durum;TrustedInstaller_Durum;DISM_CheckHealth'
-$script:ParserLegacyColumns    = @($script:ParserLegacyHeaderText -split ';')
-
-# Panel 2'de parse sonrasi eklenen kontrol kolonlari (Panel 1'deki DNS / Online / AD / CcmExec bilgisinin karsiligi)
-$script:ParserCheckColumns = @('DNS_Durumu', 'Online_mi', 'AD_Durumu', 'AD_LastLogon', 'CcmExec_Durumu', 'SCCM_Kayit')
+# Panel 2'de parse sonrasi eklenen kontrol kolonlari
+$script:ParserCheckColumns = @('DNS_Durumu', 'Online_mi', 'AD_Durumu', 'AD_LastLogon', 'Calisan_Servisler', 'Calismayan_Servisler', 'CcmExec_Durumu', 'SCCM_Kayit')
 
 # SCCM istemci eylemleri: gorunen ad -> TriggerSchedule ScheduleID listesi
 $script:ClientActions = [ordered]@{
-    'Machine Policy (Retrieval + Evaluation)'          = @('{00000000-0000-0000-0000-000000000021}', '{00000000-0000-0000-0000-000000000022}')
-    'Software Updates Scan (Update Scan)'              = @('{00000000-0000-0000-0000-000000000113}')
-    'Software Updates Deployment Evaluation'           = @('{00000000-0000-0000-0000-000000000108}')
-    'Update Scan + Update Deployment Evaluation'       = @('{00000000-0000-0000-0000-000000000113}', '{00000000-0000-0000-0000-000000000108}')
-    'Application Deployment Evaluation'                = @('{00000000-0000-0000-0000-000000000121}')
-    'Hardware Inventory'                               = @('{00000000-0000-0000-0000-000000000001}')
-    'Software Inventory'                               = @('{00000000-0000-0000-0000-000000000002}')
-    'Discovery Data Collection (DDR)'                  = @('{00000000-0000-0000-0000-000000000003}')
+    'Machine Policy (Retrieval + Evaluation)'    = @('{00000000-0000-0000-0000-000000000021}', '{00000000-0000-0000-0000-000000000022}')
+    'Software Updates Scan (Update Scan)'        = @('{00000000-0000-0000-0000-000000000113}')
+    'Software Updates Deployment Evaluation'     = @('{00000000-0000-0000-0000-000000000108}')
+    'Update Scan + Update Deployment Evaluation' = @('{00000000-0000-0000-0000-000000000113}', '{00000000-0000-0000-0000-000000000108}')
+    'Application Deployment Evaluation'          = @('{00000000-0000-0000-0000-000000000121}')
+    'Hardware Inventory'                         = @('{00000000-0000-0000-0000-000000000001}')
+    'Software Inventory'                         = @('{00000000-0000-0000-0000-000000000002}')
+    'Discovery Data Collection (DDR)'            = @('{00000000-0000-0000-0000-000000000003}')
+    'Istemci Onarimi (RepairClient / ccmrepair)' = @('@REPAIR')    # V11: ozel eylem, ScheduleID degil
+    'CcmExec (SMS Agent Host) Yeniden Baslat'    = @('@RESTART')
 }
 
 # ==================== PARALEL RUNSPACE'LERDE DE KULLANILAN FONKSIYONLAR ====================
-# NOT: Bu bolumdeki fonksiyonlar hem ana pencere hem de RunspacePool icindeki
-# runspace'ler tarafindan kullanilir. Disaridan hicbir degiskene referans vermezler.
-# Kaynak kodlari New-WorkerScript ile runspace scriptinin basina gomulur.
+# NOT: Bu bolumdeki fonksiyonlar hem ana pencere hem de RunspacePool icindeki runspace'ler tarafindan kullanilir.
+# Disaridan hicbir $script: degiskenine referans vermezler. Kaynak kodlari New-WorkerScript ile worker'a gomulur.
 
-function Test-HostOnline {
-    param([string]$ComputerName)
-    return [bool](Test-Connection -ComputerName $ComputerName -Count 2 -Quiet -ErrorAction SilentlyContinue)
+function ConvertTo-WqlString {
+    # WQL sorgusuna girecek metni kacislar (\ ve ').
+    param([string]$Text)
+    return ($Text -replace '\\', '\\' -replace "'", "\'")
 }
 
-function Resolve-HostDns {
-    # Cozumlenemezse Text = "No such host is known" (isletim sistemi dilinden bagimsiz)
-    param([string]$ComputerName)
-    try {
-        $ips = @([System.Net.Dns]::GetHostAddresses($ComputerName))
-        if ($ips.Count -eq 0) {
-            return [pscustomobject]@{ Ok = $false; Text = 'No such host is known' }
-        }
-        $v4 = @($ips | Where-Object { $_.AddressFamily -eq 'InterNetwork' })
-        $use = if ($v4.Count -gt 0) { $v4 } else { $ips }
-        $txt = (($use | ForEach-Object { $_.IPAddressToString }) -join ', ')
-        return [pscustomobject]@{ Ok = $true; Text = $txt }
-    }
-    catch {
-        $ex = $_.Exception
-        while ($ex.InnerException) { $ex = $ex.InnerException }
-        if ($ex -is [System.Net.Sockets.SocketException] -and $ex.SocketErrorCode -eq [System.Net.Sockets.SocketError]::HostNotFound) {
-            return [pscustomobject]@{ Ok = $false; Text = 'No such host is known' }
-        }
-        return [pscustomobject]@{ Ok = $false; Text = "DNS hatasi: $($ex.Message)" }
-    }
+function Get-ErrText {
+    # Istisna zincirindeki en anlamli (en ic) mesaji dondurur.
+    param($Exception)
+    $e = $Exception
+    while ($e.InnerException) { $e = $e.InnerException }
+    if ($e.Message -and $e -ne $Exception) { return "$($Exception.Message) ($($e.Message))" }
+    return $Exception.Message
 }
 
-function Convert-FileTimeSafe {
-    param($Value)
+function Test-Ping {
+    # Hizli ICMP kontrolu (.NET Ping). PS 5.1'deki Test-Connection (WMI Win32_PingStatus) cok daha yavastir.
+    param([string]$Address, [int]$Count = 2, [int]$TimeoutMs = 1000)
+    $p = New-Object System.Net.NetworkInformation.Ping
     try {
-        $v = [int64]$Value
-        if ($v -le 0 -or $v -ge 9223372036854775807) { return $null }
-        return [DateTime]::FromFileTime($v)
+        for ($i = 0; $i -lt $Count; $i++) {
+            try { if ($p.Send($Address, $TimeoutMs).Status -eq 'Success') { return $true } } catch { }
+        }
+        return $false
+    }
+    finally { $p.Dispose() }
+}
+
+function Test-TcpPort {
+    param([string]$Address, [int]$Port, [int]$TimeoutMs = 1500)
+    $c = New-Object System.Net.Sockets.TcpClient
+    try {
+        $ar = $c.BeginConnect($Address, $Port, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $false }
+        $c.EndConnect($ar)
+        return $true
+    }
+    catch { return $false }
+    finally { $c.Close() }
+}
+
+function Get-NetBiosName {
+    # NetBIOS node status sorgusu (nbtstat -A esdegeri, UDP 137). Kimlik dogrulamasi gerektirmez;
+    # IP adresindeki cihazin GERCEK adini dondurur. Cevap yoksa $null.
+    param([string]$Ip, [int]$TimeoutMs = 1000)
+    $u = New-Object System.Net.Sockets.UdpClient
+    try {
+        $u.Client.ReceiveTimeout = $TimeoutMs
+        # Baslik (TxID, flags=0, QD=1) + '*' adinin kodlanmis hali (CKAAAA...) + NBSTAT(0x21) / IN(1)
+        $q = [byte[]](@(0x4E, 0x42, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0x20, 0x43, 0x4B) + @(,0x41 * 30) + @(0, 0, 0x21, 0, 1))
+        [void]$u.Send($q, $q.Length, $Ip, 137)
+        $ep = New-Object System.Net.IPEndPoint ([System.Net.IPAddress]::Any, 0)
+        $b = $u.Receive([ref]$ep)
+        if ($b.Length -lt 57) { return $null }
+        for ($i = 0; $i -lt $b[56]; $i++) {
+            $o = 57 + $i * 18
+            if ($o + 18 -gt $b.Length) { break }
+            # Sonek 0x00 (workstation) ve grup olmayan (flags bit 15 = 0) ilk ad = makine adi
+            if ($b[$o + 15] -eq 0 -and ($b[$o + 16] -band 0x80) -eq 0) {
+                return [System.Text.Encoding]::ASCII.GetString($b, $o, 15).Trim()
+            }
+        }
+        return $null
     }
     catch { return $null }
-}
-
-function Get-AdComputerInfo {
-    # Active Directory'den bilgisayar hesabini RSAT (ActiveDirectory modulu) ile bulur.
-    # Status: Enabled / Disabled / Bulunamadi / Sorgulanamadi
-    # LastLogon: lastLogonTimestamp (replike, ~14 gun gecikmeli) ile sorgulanan DC'lerdeki
-    # lastLogon degerlerinin en yenisi. $QueryAllDCs = $true ise (GLOBAL TARAMA) domaindeki
-    # tum DC'ler tek tek sorgulanir (daha dogru ama yavas).
-    # Gereksinim: RSAT - Active Directory PowerShell modulu + ADWS (TCP 9389) erisimi.
-    param([string]$ComputerName, [bool]$QueryAllDCs = $false)
-
-    $res = [pscustomobject]@{ Status = 'Bulunamadi'; LastLogon = 'N/A'; Detail = '' }
-
-    # ---- RSAT modulu ----
-    if (-not (Get-Module -Name ActiveDirectory)) {
-        try { Import-Module -Name ActiveDirectory -ErrorAction Stop -Verbose:$false }
-        catch {
-            $res.Status = 'Sorgulanamadi'
-            $res.Detail = "ActiveDirectory modulu (RSAT) yuklenemedi: $($_.Exception.Message)"
-            return $res
-        }
-    }
-
-    $short  = ($ComputerName -split '\.')[0]
-    $safe   = $short.Replace('\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29')
-    $filter = "(&(objectCategory=computer)(sAMAccountName=$safe`$))"
-    $props  = @('Enabled', 'LastLogonTimestamp', 'LastLogon', 'DistinguishedName')
-
-    $found = $null
-    $viaGc = $false
-
-    # ---- 1) Mevcut domain ----
-    try {
-        $found = Get-ADComputer -LDAPFilter $filter -Properties $props -ErrorAction Stop | Select-Object -First 1
-    }
-    catch {
-        $res.Status = 'Sorgulanamadi'
-        $res.Detail = "AD sorgusu basarisiz: $($_.Exception.Message)"
-        return $res
-    }
-
-    # ---- 2) Domain'de yoksa forest Global Catalog'da ara (baska domain'deki hesaplar icin) ----
-    if (-not $found) {
-        try {
-            $gc = Get-ADDomainController -Discover -Service GlobalCatalog -ErrorAction Stop
-            $gcHost = @($gc.HostName)[0]
-            $found = Get-ADComputer -LDAPFilter $filter -Server "${gcHost}:3268" `
-                -Properties @('Enabled', 'LastLogonTimestamp', 'DistinguishedName') -ErrorAction Stop |
-                Select-Object -First 1
-            if ($found) { $viaGc = $true }
-        }
-        catch { }
-    }
-
-    if (-not $found) { return $res }   # Status zaten 'Bulunamadi'
-
-    $res.Status = if ($found.Enabled) { 'Enabled' } else { 'Disabled' }
-
-    $times = @()
-    foreach ($pn in @('LastLogonTimestamp', 'LastLogon')) {
-        $v = $found.$pn
-        if ($null -ne $v) {
-            $t = Convert-FileTimeSafe $v
-            if ($t) { $times += $t }
-        }
-    }
-
-    # ---- 3) GLOBAL TARAMA: domaindeki tum DC'lerden gercek lastLogon ----
-    if ($QueryAllDCs -and -not $viaGc -and $found.DistinguishedName) {
-        $dn = [string]$found.DistinguishedName
-        $unreach = 0
-        try {
-            # DC listesi runspace basina 10 dk onbellekte tutulur (cok makinede tekrar tekrar sorgulanmasin)
-            $cache = $global:AdDcCache
-            if (-not $cache -or ((Get-Date) - $cache.Time).TotalMinutes -gt 10) {
-                $list  = @(Get-ADDomainController -Filter * -ErrorAction Stop | ForEach-Object { [string]$_.HostName })
-                $cache = [pscustomobject]@{ Time = (Get-Date); Hosts = $list }
-                $global:AdDcCache = $cache
-            }
-
-            foreach ($dc in $cache.Hosts) {
-                # Ulasilamayan DC'de uzun beklememek icin ADWS portuna 2 sn'lik hizli kontrol
-                $reach = $false
-                $tcp = $null
-                try {
-                    $tcp = New-Object System.Net.Sockets.TcpClient
-                    $iar = $tcp.BeginConnect($dc, 9389, $null, $null)
-                    if ($iar.AsyncWaitHandle.WaitOne(2000, $false)) { $tcp.EndConnect($iar); $reach = $true }
-                }
-                catch { $reach = $false }
-                finally { if ($tcp) { $tcp.Close() } }
-                if (-not $reach) { $unreach++; continue }
-
-                try {
-                    $one = Get-ADComputer -Identity $dn -Server $dc -Properties LastLogon -ErrorAction Stop
-                    if ($null -ne $one.LastLogon) {
-                        $t = Convert-FileTimeSafe $one.LastLogon
-                        if ($t) { $times += $t }
-                    }
-                }
-                catch { }
-            }
-        }
-        catch {
-            $res.Detail = "DC listesi alinamadi, global tarama yapilamadi: $($_.Exception.Message)"
-        }
-        if ($unreach -gt 0) {
-            $msg = "$unreach DC'ye ulasilamadi (ADWS 9389); LastLogon eksik DC verisiyle hesaplandi"
-            $res.Detail = if ($res.Detail) { "$($res.Detail) | $msg" } else { $msg }
-        }
-    }
-
-    if ($times.Count -gt 0) {
-        $best = $times | Sort-Object -Descending | Select-Object -First 1
-        $res.LastLogon = $best.ToString('yyyy-MM-dd HH:mm')
-    }
-    else {
-        $res.LastLogon = 'Hic'
-    }
-    return $res
-}
-
-function Get-RemoteStatus {
-    param(
-        [string]$ComputerName,
-        [string[]]$ServiceNames,
-        [bool]$QueryAllDCs = $false
-    )
-
-    $row = [pscustomobject]@{
-        Hostname      = $ComputerName
-        DnsStatus     = ''
-        IsOnline      = $false
-        AdStatus      = ''
-        LastLogon     = ''
-        Running       = ''
-        NotRunning    = ''
-        CcmExec       = ''
-        ServiceDetail = @()   # Name/Status listesi -> Servis baslatma asamasinda kullanilir
-        ErrorMessage  = ''
-        State         = 'fail'
-    }
-    $errs = @()
-
-    # ---- DNS ----
-    $dns = Resolve-HostDns -ComputerName $ComputerName
-    $row.DnsStatus = $dns.Text
-
-    # ---- Active Directory ----
-    $ad = Get-AdComputerInfo -ComputerName $ComputerName -QueryAllDCs $QueryAllDCs
-    $row.AdStatus  = $ad.Status
-    $row.LastLogon = $ad.LastLogon
-    if ($ad.Detail) { $errs += $ad.Detail }
-
-    if (-not $dns.Ok) {
-        $errs += 'DNS cozumlenemedi, ping/servis kontrolu yapilmadi'
-        $row.ErrorMessage = ($errs -join ' | ')
-        return $row
-    }
-
-    # ---- Cevrimici (ping) ----
-    $online = Test-HostOnline -ComputerName $ComputerName
-    $row.IsOnline = [bool]$online
-    if (-not $online) {
-        $errs += 'Makine yanit vermiyor (ping basarisiz)'
-        $row.ErrorMessage = ($errs -join ' | ')
-        return $row
-    }
-
-    # ---- Servisler: tek RPC cagrisi ile tum liste alinir, yerelde suzulur ----
-    $all = $null
-    try { $all = @(Get-Service -ComputerName $ComputerName -ErrorAction Stop) }
-    catch { $errs += "Servis listesi alinamadi: $($_.Exception.Message)" }
-
-    $detail = @()
-    foreach ($sn in $ServiceNames) {
-        $n = "$sn".Trim()
-        if (-not $n) { continue }
-        if ($null -eq $all) {
-            $detail += [pscustomobject]@{ Name = $n; Status = 'Erisilemedi' }
-            continue
-        }
-        $m = $all | Where-Object { $_.Name -eq $n -or $_.DisplayName -eq $n } | Select-Object -First 1
-        if ($m) { $detail += [pscustomobject]@{ Name = $n; Status = $m.Status.ToString() } }
-        else    { $detail += [pscustomobject]@{ Name = $n; Status = 'NotFound' } }
-    }
-    $row.ServiceDetail = $detail
-    $row.Running    = (($detail | Where-Object { $_.Status -eq 'Running' } | ForEach-Object { $_.Name }) -join ', ')
-    $row.NotRunning = (($detail | Where-Object { $_.Status -ne 'Running' } | ForEach-Object { "$($_.Name)($($_.Status))" }) -join ', ')
-
-    # ---- SCCM ajani (CcmExec) ----
-    if ($null -eq $all) {
-        $row.CcmExec = 'Erisilemedi'
-    }
-    else {
-        $cc = $all | Where-Object { $_.Name -eq 'CcmExec' } | Select-Object -First 1
-        $row.CcmExec = if ($cc) { $cc.Status.ToString() } else { 'Yok' }
-    }
-
-    $row.ErrorMessage = ($errs -join ' | ')
-    $row.State = if ($row.NotRunning -or $row.CcmExec -eq 'Yok') { 'warn' } else { 'ok' }
-    return $row
-}
-
-function Start-RemoteFix {
-    param(
-        [string]$ComputerName,
-        [pscustomobject[]]$ServiceDetail   # kontrol asamasindaki ONCEKI durum
-    )
-
-    $results = @()
-    foreach ($s in $ServiceDetail) {
-
-        if ($s.Status -eq 'Running') {
-            $results += [pscustomobject]@{ Hostname = $ComputerName; ServiceName = $s.Name; OncekiDurum = $s.Status; SonrakiDurum = $s.Status; Aciklama = 'Zaten calisiyordu, islem yapilmadi.' }
-            continue
-        }
-        if ($s.Status -eq 'NotFound' -or $s.Status -eq 'Erisilemedi') {
-            $results += [pscustomobject]@{ Hostname = $ComputerName; ServiceName = $s.Name; OncekiDurum = $s.Status; SonrakiDurum = $s.Status; Aciklama = "Durum $($s.Status), islem yapilmadi." }
-            continue
-        }
-
-        try {
-            Get-Service -ComputerName $ComputerName -Name $s.Name -ErrorAction Stop | Start-Service -ErrorAction Stop
-            Start-Sleep -Milliseconds 800
-            $newStatus = (Get-Service -ComputerName $ComputerName -Name $s.Name -ErrorAction Stop).Status.ToString()
-            $desc = if ($newStatus -eq 'Running') { "$($s.Status) durumundaydi, Running yapildi." } else { "Baslatildi ama durum hala $newStatus." }
-            $results += [pscustomobject]@{ Hostname = $ComputerName; ServiceName = $s.Name; OncekiDurum = $s.Status; SonrakiDurum = $newStatus; Aciklama = $desc }
-        }
-        catch {
-            $results += [pscustomobject]@{ Hostname = $ComputerName; ServiceName = $s.Name; OncekiDurum = $s.Status; SonrakiDurum = 'Bilinmiyor'; Aciklama = "Hata: $($_.Exception.Message)" }
-        }
-    }
-    return $results
+    finally { $u.Close() }
 }
 
 function Get-WmiFailureReason {
-    # WMI/DCOM hatasini siniflandirir: NoAgent / Rpc / Access / Other
+    # WMI/DCOM hatasini siniflandirir: NoAgent / Rpc / Access / Identity / Other
     param($ErrorRecord)
 
-    $kind = 'Other'
+    $kind  = 'Other'
     $first = $ErrorRecord.Exception.Message
-    $e = $ErrorRecord.Exception
-
+    $e     = $ErrorRecord.Exception
     while ($e) {
         if ($e -is [System.Management.ManagementException]) {
             $code = $e.ErrorCode.ToString()
@@ -416,26 +210,360 @@ function Get-WmiFailureReason {
         if ($e -is [System.UnauthorizedAccessException]) { $kind = 'Access'; break }
         if ($e -is [System.Runtime.InteropServices.COMException]) {
             $hr = $e.ErrorCode
-            if ($hr -eq -2147023174 -or $hr -eq -2147023170) { $kind = 'Rpc';     break }   # 0x800706BA / 0x800706BE
-            if ($hr -eq -2147024891)                         { $kind = 'Access';  break }   # 0x80070005
-            if ($hr -eq -2147217394)                         { $kind = 'NoAgent'; break }   # 0x8004100E
+            if ($hr -eq -2147023174 -or $hr -eq -2147023170) { $kind = 'Rpc';      break }   # 0x800706BA / 0x800706BE
+            if ($hr -eq -2147024891)                         { $kind = 'Access';   break }   # 0x80070005
+            if ($hr -eq -2147217394)                         { $kind = 'NoAgent';  break }   # 0x8004100E
+            if ($hr -eq -2146893022)                         { $kind = 'Identity'; break }   # 0x80090322 SEC_E_WRONG_PRINCIPAL
         }
         $e = $e.InnerException
     }
-
     if ($kind -eq 'Other') {
-        if ($first -match 'Invalid namespace|0x8004100E') { $kind = 'NoAgent' }
-        elseif ($first -match 'RPC server|0x800706BA|0x800706BE') { $kind = 'Rpc' }
-        elseif ($first -match 'Access is denied|0x80070005') { $kind = 'Access' }
+        if     ($first -match 'Invalid namespace|0x8004100E')                    { $kind = 'NoAgent' }
+        elseif ($first -match 'RPC server|0x800706BA|0x800706BE')                { $kind = 'Rpc' }
+        elseif ($first -match 'Access is denied|0x80070005')                     { $kind = 'Access' }
+        elseif ($first -match 'target principal name is incorrect|0x80090322')   { $kind = 'Identity' }
     }
-
     $text = switch ($kind) {
-        'NoAgent' { "SCCM ajani bulunmuyor (root\ccm namespace'i yok)." }
-        'Rpc'     { 'RPC sunucusu kullanilamiyor (makine kapali/firewall).' }
-        'Access'  { 'Erisim engellendi (hedefte yerel admin yetkisi gerekli).' }
-        default   { $first }
+        'NoAgent'  { "SCCM ajani bulunmuyor (root\ccm namespace'i yok)." }
+        'Rpc'      { 'RPC sunucusu kullanilamiyor (makine kapali/firewall).' }
+        'Access'   { 'Erisim engellendi (hedefte yerel admin yetkisi gerekli).' }
+        'Identity' { 'Kerberos hedef adi uyusmuyor (IP baska cihazda olabilir).' }
+        default    { $first }
     }
     return [pscustomobject]@{ Kind = $kind; Text = $text }
+}
+
+function Get-WmiComputerName {
+    # DCOM/WMI ile hedefin kendi bildirdigi bilgisayar adini okur (scripti calistiran kullanicinin yetkisiyle).
+    param([string]$Target, [int]$TimeoutSec = 15)
+    try {
+        $opt = New-Object System.Management.ConnectionOptions
+        $opt.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
+        $sc = New-Object System.Management.ManagementScope ("\\$Target\root\cimv2", $opt)
+        $sc.Connect()
+        $eo = New-Object System.Management.EnumerationOptions
+        $eo.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
+        $s = New-Object System.Management.ManagementObjectSearcher ($sc, (New-Object System.Management.ObjectQuery 'SELECT Name FROM Win32_ComputerSystem'), $eo)
+        foreach ($o in $s.Get()) { return [pscustomobject]@{ Name = [string]$o['Name']; Kind = ''; Text = '' } }
+        return [pscustomobject]@{ Name = ''; Kind = 'Other'; Text = 'Win32_ComputerSystem bos dondu' }
+    }
+    catch {
+        $why = Get-WmiFailureReason -ErrorRecord $_
+        return [pscustomobject]@{ Name = ''; Kind = $why.Kind; Text = $why.Text }
+    }
+}
+
+function Get-DnsWildcardIps {
+    # Var olmayan RASTGELE bir ad cozumlenebiliyorsa DNS "joker" cevap veriyor demektir (router / modem DNS'i, wildcard
+    # kayit): olmayan her ada ayni IP (or. gateway 192.168.1.1) doner ve ping cevap verir. Bu IP'ler gercek kayit sayilmaz.
+    # Sonuc runspace basina 10 dk onbellekte tutulur.
+    $c = $global:DnsWildcard
+    if ($c -and ((Get-Date) - $c.Time).TotalMinutes -lt 10) { return $c.Ips }
+    $ips = @()
+    try { $ips = @([System.Net.Dns]::GetHostAddresses("ct-yok-$([guid]::NewGuid().ToString('N').Substring(0, 12))") | ForEach-Object { $_.IPAddressToString }) } catch { }
+    $global:DnsWildcard = [pscustomobject]@{ Time = Get-Date; Ips = $ips }
+    return $ips
+}
+
+function Resolve-HostDns {
+    # Cozumlenemezse Text = "No such host is known" (isletim sistemi dilinden bagimsiz). Ips: once IPv4.
+    # DNS joker cevabi (Get-DnsWildcardIps) kayit YOK sayilir.
+    param([string]$ComputerName)
+    try {
+        $ips = @([System.Net.Dns]::GetHostAddresses($ComputerName))
+        if ($ips.Count -eq 0) { return [pscustomobject]@{ Ok = $false; Text = 'No such host is known'; Ips = @() } }
+        $v4  = @($ips | Where-Object { $_.AddressFamily -eq 'InterNetwork' })
+        $use = @($(if ($v4.Count -gt 0) { $v4 } else { $ips }) | ForEach-Object { $_.IPAddressToString })
+        $wc  = @(Get-DnsWildcardIps)
+        if ($wc.Count -gt 0 -and @($use | Where-Object { $wc -notcontains $_ }).Count -eq 0) {
+            return [pscustomobject]@{ Ok = $false; Text = "No such host is known (DNS joker cevap: $($use -join ', '))"; Ips = @() }
+        }
+        return [pscustomobject]@{ Ok = $true; Text = ($use -join ', '); Ips = $use }
+    }
+    catch {
+        $ex = $_.Exception
+        while ($ex.InnerException) { $ex = $ex.InnerException }
+        if ($ex -is [System.Net.Sockets.SocketException] -and $ex.SocketErrorCode -eq [System.Net.Sockets.SocketError]::HostNotFound) {
+            return [pscustomobject]@{ Ok = $false; Text = 'No such host is known'; Ips = @() }
+        }
+        return [pscustomobject]@{ Ok = $false; Text = "DNS hatasi: $($ex.Message)"; Ips = @() }
+    }
+}
+
+function Get-HostReach {
+    # DNS + ping + KIMLIK DOGRULAMA.
+    # Sorun: VPN'e baglanmis bir makinenin DNS kaydi eski IP'de kalir; o IP baska bir cihaza verildiginde ping
+    # cevap gelir ve makine "cevrimici" sanilir (servis/WMI istekleri de YANLIS cihaza gider).
+    # Cozum: ping cevabi veren IP'deki cihazin adi okunur ve beklenen adla karsilastirilir:
+    #   1) NetBIOS node status (UDP 137, kimlik dogrulamasiz, hizli)
+    #   2) Cevap yoksa: TCP 135 on kontrolu + WMI Win32_ComputerSystem.Name (DCOM, IWA). Kerberos'un
+    #      "target principal name is incorrect" hatasi da uyusmazlik kaniti sayilir.
+    # Online = ping VAR ve ad UYUSMAZLIGI YOK. Identity: Dogrulandi | Uyusmuyor | Dogrulanamadi | '' (ping yok)
+    param([string]$ComputerName)
+
+    $short = (([string]$ComputerName -split '\.')[0]).Trim()
+    $nbExp = $short.Substring(0, [Math]::Min(15, $short.Length))
+    $r = [pscustomobject]@{ DnsOk = $false; DnsText = ''; Ip = ''; Online = $false; Identity = ''; ActualName = ''; OnlineText = 'Hayir'; Note = '' }
+
+    $dns = Resolve-HostDns -ComputerName $ComputerName
+    $r.DnsOk = $dns.Ok
+    $r.DnsText = $dns.Text
+    if (-not $dns.Ok) { $r.Note = 'DNS cozumlenemedi, ping/servis kontrolu yapilmadi'; return $r }
+
+    $alive = @($dns.Ips | Where-Object { Test-Ping -Address $_ })
+    if ($alive.Count -eq 0) { $r.Note = 'Makine yanit vermiyor (ping basarisiz)'; return $r }
+
+    # 1) NetBIOS: ping veren her IP icin cihazin gercek adi
+    $wrong = @()
+    foreach ($ip in $alive) {
+        $nb = Get-NetBiosName -Ip $ip
+        if (-not $nb) { continue }
+        if ([string]::Equals($nb, $nbExp, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $r.Ip = $ip; $r.Online = $true; $r.Identity = 'Dogrulandi'; $r.ActualName = $nb; $r.OnlineText = 'Evet'
+            return $r
+        }
+        $wrong += [pscustomobject]@{ Ip = $ip; Name = $nb }
+    }
+    $r.Ip = $alive[0]
+
+    # 2) WMI (ad uzerinden; sonraki servis/WMI istekleri de bu adla gidecegi icin dogru soru budur)
+    $w = $null
+    if (Test-TcpPort -Address $alive[0] -Port 135) { $w = Get-WmiComputerName -Target $ComputerName }
+    if ($w -and $w.Name) {
+        if ([string]::Equals($w.Name, $short, [System.StringComparison]::OrdinalIgnoreCase) -or
+            [string]::Equals($w.Name, $nbExp, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $r.Online = $true; $r.Identity = 'Dogrulandi'; $r.ActualName = $w.Name; $r.OnlineText = 'Evet'
+            return $r
+        }
+        $wrong = @([pscustomobject]@{ Ip = $alive[0]; Name = $w.Name })
+    }
+    elseif ($w -and $w.Kind -eq 'Identity' -and $wrong.Count -eq 0) {
+        $hint = ''
+        try { $hint = ([System.Net.Dns]::GetHostEntry($alive[0]).HostName -split '\.')[0] } catch { }
+        if ($hint -and -not [string]::Equals($hint, $short, [System.StringComparison]::OrdinalIgnoreCase)) { $hint = " (PTR: $hint)" } else { $hint = '' }
+        $wrong = @([pscustomobject]@{ Ip = $alive[0]; Name = "bilinmeyen cihaz$hint" })
+    }
+
+    if ($wrong.Count -gt 0) {
+        $x = $wrong[0]
+        $r.Identity   = 'Uyusmuyor'
+        $r.ActualName = $x.Name
+        $r.Ip         = $x.Ip
+        $r.OnlineText = "Hayir (IP baska cihazda: $($x.Name))"
+        $r.Note = "Ping cevabi BASKA cihazdan geliyor: $($x.Ip) su an '$($x.Name)' (eski DNS kaydi / VPN). Makine cevrimdisi kabul edildi."
+        return $r
+    }
+
+    # Ad okunamadi (NetBIOS cevap yok + WMI ile ad okunamadi): ping cevabi BU makineden mi bilinmiyor.
+    # Yanlis "cevrimici" (gateway / baska cihaz / joker DNS) sonucunu onlemek icin CEVRIMDISI kabul edilir.
+    $r.Online = $false
+    $r.Identity = 'Dogrulanamadi'
+    $r.OnlineText = "Hayir (ping var, cihaz dogrulanamadi: $($alive[0]))"
+    $why = if ($w) { $w.Text } else { 'TCP 135 (RPC) kapali' }
+    $r.Note = "Ping cevabi var ($($alive[0])) ancak cevap verenin bu makine oldugu dogrulanamadi (NetBIOS cevap yok; WMI: $why). Cevrimdisi kabul edildi."
+    return $r
+}
+
+function Convert-FileTimeSafe {
+    param($Value)
+    try {
+        $v = [int64]$Value
+        if ($v -le 0 -or $v -ge [int64]::MaxValue) { return $null }
+        return [DateTime]::FromFileTime($v)
+    }
+    catch { return $null }
+}
+
+function Get-AdCacheIndex {
+    # AD onbellek CSV'sini okuyup hostname -> kayit hashtable'i dondurur. Yol $env:CLIENTTOOL_ADCACHE_FILE'dan alinir
+    # (process geneli; runspace'ler de gorur). Veri runspace icinde bellekte tutulur; CSV degisince yeniden okunur.
+    $r = [pscustomobject]@{ Ok = $false; Error = ''; Map = $null; Count = 0; Time = $null }
+
+    $file = [string]$env:CLIENTTOOL_ADCACHE_FILE
+    if (-not $file) { $r.Error = 'AD onbellek dosya yolu tanimli degil'; return $r }
+    if (-not (Test-Path -LiteralPath $file)) {
+        $r.Error = "AD onbellegi bulunamadi ($file). 'AD Onbellegini Guncelle' ile olusturun."
+        return $r
+    }
+
+    $stamp = (Get-Item -LiteralPath $file).LastWriteTimeUtc
+    $mem   = $global:AdCacheMem
+    if ($mem -and $mem.File -eq $file -and $mem.Stamp -eq $stamp) {
+        $r.Ok = $true; $r.Map = $mem.Map; $r.Count = $mem.Count; $r.Time = $mem.Time
+        return $r
+    }
+
+    # Guncelleme sirasinda dosya o an degisiyor olabilir: birkac kez dene
+    $rows = $null
+    for ($try = 0; $try -lt 3 -and $null -eq $rows; $try++) {
+        try { $rows = @(Import-Csv -LiteralPath $file -Delimiter ';' -Encoding UTF8 -ErrorAction Stop) }
+        catch { Start-Sleep -Milliseconds 300 }
+    }
+    if ($null -eq $rows) {
+        if ($mem -and $mem.File -eq $file) { $r.Ok = $true; $r.Map = $mem.Map; $r.Count = $mem.Count; $r.Time = $mem.Time; return $r }
+        $r.Error = "AD onbellegi okunamadi: $file"
+        return $r
+    }
+
+    # @{} anahtarlari GECERLI KULTURE gore karsilastirir (tr-TR'de I/i): kulturden bagimsiz OrdinalIgnoreCase kullanilir.
+    $map = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($row in $rows) {
+        $k = ([string]$row.Hostname).Trim()
+        if (-not $k) { continue }
+        if ($map.ContainsKey($k)) { $map[$k] = @($map[$k]) + $row } else { $map[$k] = $row }
+    }
+    $global:AdCacheMem = [pscustomobject]@{ File = $file; Stamp = $stamp; Map = $map; Count = $rows.Count; Time = $stamp.ToLocalTime() }
+    $r.Ok = $true; $r.Map = $map; $r.Count = $rows.Count; $r.Time = $global:AdCacheMem.Time
+    return $r
+}
+
+function Get-AdOuComputers {
+    # Bir domain'in verilen OU'larinin ALTINDAKI (alt OU'lar dahil) bilgisayar hesaplarini AD'den okur.
+    # Ayni domain'in OU'lari TEK is icinde sirayla taranir. Her OU'nun sonucu ayri doner.
+    param([string]$Domain, [string[]]$SearchBases)
+
+    $items = @()
+    $modErr = ''
+    if (-not (Get-Module -Name ActiveDirectory)) {
+        try { Import-Module -Name ActiveDirectory -ErrorAction Stop -Verbose:$false }
+        catch { $modErr = "ActiveDirectory modulu (RSAT) yuklenemedi: $($_.Exception.Message)" }
+    }
+
+    foreach ($sb in @($SearchBases)) {
+        $it = [pscustomobject]@{ SearchBase = [string]$sb; Ok = $false; Error = ''; Rows = @() }
+        if ($modErr) { $it.Error = $modErr; $items += $it; continue }
+        try {
+            $comps = @(Get-ADComputer -Filter * -SearchBase $sb -SearchScope Subtree -Server $Domain `
+                    -Properties @('Enabled', 'LastLogonTimestamp', 'DistinguishedName') -ResultPageSize 1000 -ErrorAction Stop)
+            $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $it.Rows = @(foreach ($c in $comps) {
+                $t = Convert-FileTimeSafe $c.LastLogonTimestamp
+                [pscustomobject]@{
+                    Hostname           = [string]$c.Name
+                    Domain             = $Domain
+                    Enabled            = [string][bool]$c.Enabled
+                    LastLogonTimestamp = $(if ($t) { $t.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
+                    DistinguishedName  = [string]$c.DistinguishedName
+                    CacheTime          = $now
+                }
+            })
+            $it.Ok = $true
+        }
+        catch { $it.Error = "AD sorgusu basarisiz: $($_.Exception.Message)" }
+        $items += $it
+    }
+    return [pscustomobject]@{ Domain = $Domain; Items = $items }
+}
+
+function Get-AdComputerInfo {
+    # AD bilgisini AD'ye SORGU ATMADAN onbellek CSV'sinden okur.
+    # Status: Enabled / Disabled / Bulunamadi / Sorgulanamadi. LastLogon: lastLogonTimestamp (~14 gun gecikmeli).
+    param([string]$ComputerName)
+
+    $res = [pscustomobject]@{ Status = 'Bulunamadi'; LastLogon = 'N/A'; Detail = '' }
+    $idx = Get-AdCacheIndex
+    if (-not $idx.Ok) { $res.Status = 'Sorgulanamadi'; $res.Detail = $idx.Error; return $res }
+
+    $short = (([string]$ComputerName -split '\.')[0]).Trim()
+    if (-not $idx.Map.ContainsKey($short)) {
+        $res.Detail = "AD onbellegindeki OU'larda bulunamadi (onbellek: $($idx.Time.ToString('yyyy-MM-dd HH:mm')), $($idx.Count) kayit)"
+        return $res
+    }
+
+    # Ayni isim birden fazla domain'de varsa en yeni lastLogonTimestamp'e sahip olan secilir
+    $hits  = @($idx.Map[$short])
+    $found = $hits | Sort-Object -Property LastLogonTimestamp -Descending | Select-Object -First 1
+    if ($hits.Count -gt 1) {
+        $res.Detail = "Birden fazla domain'de bulundu ($((@($hits | ForEach-Object { $_.Domain }) -join ', '))); en yeni lastLogon'a sahip kayit kullanildi"
+    }
+    $res.Status = if ($found.Enabled -eq 'True') { 'Enabled' } else { 'Disabled' }
+    $res.LastLogon = 'Hic'
+    if ($found.LastLogonTimestamp) {
+        try { $res.LastLogon = [DateTime]::ParseExact([string]$found.LastLogonTimestamp, 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture).ToString('yyyy-MM-dd HH:mm') }
+        catch { }
+    }
+    return $res
+}
+
+function Get-ServiceCheck {
+    # Istenen servislerin + CcmExec'in durumunu TEK RPC cagrisi (ServiceController.GetServices) ile alir.
+    # Ad veya gorunen ad ile eslesir; karsilastirma kulturden bagimsizdir (tr-TR'de 'bits' = 'BITS').
+    param([string]$ComputerName, [string[]]$ServiceNames = @())
+
+    $r = [pscustomobject]@{ Running = ''; NotRunning = ''; CcmExec = ''; ServiceDetail = @(); Note = '' }
+    $map = $null
+    try {
+        $all = [System.ServiceProcess.ServiceController]::GetServices($ComputerName)
+        $map = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($s in $all) {
+            $st = $s.Status.ToString()
+            $map[$s.ServiceName] = $st
+            if (-not $map.ContainsKey($s.DisplayName)) { $map[$s.DisplayName] = $st }
+            $s.Dispose()
+        }
+    }
+    catch { $r.Note = "Servis listesi alinamadi: $(Get-ErrText $_.Exception)" }
+
+    $detail = @(foreach ($sn in $ServiceNames) {
+        $n = "$sn".Trim()
+        if (-not $n) { continue }
+        $st = if ($null -eq $map) { 'Erisilemedi' } elseif ($map.ContainsKey($n)) { $map[$n] } else { 'NotFound' }
+        [pscustomobject]@{ Name = $n; Status = $st }
+    })
+    $r.ServiceDetail = $detail
+    $r.Running    = (($detail | Where-Object { $_.Status -eq 'Running' } | ForEach-Object { $_.Name }) -join ', ')
+    $r.NotRunning = (($detail | Where-Object { $_.Status -ne 'Running' } | ForEach-Object { "$($_.Name)($($_.Status))" }) -join ', ')
+    $r.CcmExec    = if ($null -eq $map) { 'Erisilemedi' } elseif ($map.ContainsKey('CcmExec')) { $map['CcmExec'] } else { 'Yok' }
+    return $r
+}
+
+function Get-RemoteStatus {
+    # "Kontrol Et": DNS + ping + kimlik + AD (onbellek) + servisler. Ulasilamazsa State = 'fail'.
+    param([string]$ComputerName, [string[]]$ServiceNames)
+
+    $reach = Get-HostReach -ComputerName $ComputerName
+    $ad    = Get-AdComputerInfo -ComputerName $ComputerName
+    $row = [pscustomobject]@{
+        Hostname = $ComputerName; DnsStatus = $reach.DnsText; IsOnline = $reach.Online; OnlineText = $reach.OnlineText
+        AdStatus = $ad.Status; LastLogon = $ad.LastLogon; Running = ''; NotRunning = ''; CcmExec = ''
+        ServiceDetail = @(); ErrorMessage = ''; State = 'fail'
+    }
+    $errs = @($ad.Detail, $reach.Note | Where-Object { $_ })
+    if ($reach.Online) {
+        $svc = Get-ServiceCheck -ComputerName $ComputerName -ServiceNames $ServiceNames
+        $row.Running = $svc.Running; $row.NotRunning = $svc.NotRunning; $row.CcmExec = $svc.CcmExec; $row.ServiceDetail = $svc.ServiceDetail
+        if ($svc.Note) { $errs += $svc.Note }
+        $row.State = if ($row.NotRunning -or $row.CcmExec -eq 'Yok' -or $reach.Identity -ne 'Dogrulandi') { 'warn' } else { 'ok' }
+    }
+    $row.ErrorMessage = ($errs -join ' | ')
+    return $row
+}
+
+function Start-RemoteFix {
+    param([string]$ComputerName, [pscustomobject[]]$ServiceDetail)   # ServiceDetail: kontrol asamasindaki ONCEKI durum
+
+    $results = @()
+    foreach ($s in $ServiceDetail) {
+        $o = [pscustomobject]@{ Hostname = $ComputerName; ServiceName = $s.Name; OncekiDurum = $s.Status; SonrakiDurum = $s.Status; Aciklama = '' }
+        if ($s.Status -eq 'Running') { $o.Aciklama = 'Zaten calisiyordu, islem yapilmadi.'; $results += $o; continue }
+        if ($s.Status -eq 'NotFound' -or $s.Status -eq 'Erisilemedi') { $o.Aciklama = "Durum $($s.Status), islem yapilmadi."; $results += $o; continue }
+
+        $sc = $null
+        try {
+            $sc = New-Object System.ServiceProcess.ServiceController ($s.Name, $ComputerName)
+            if ($sc.Status -ne 'Running') {
+                if ($sc.Status -ne 'StartPending') { $sc.Start() }
+                try { $sc.WaitForStatus('Running', [TimeSpan]::FromSeconds(20)) } catch { }
+                $sc.Refresh()
+            }
+            $o.SonrakiDurum = $sc.Status.ToString()
+            $o.Aciklama = if ($o.SonrakiDurum -eq 'Running') { "$($s.Status) durumundaydi, Running yapildi." } else { "Baslatildi ama durum hala $($o.SonrakiDurum)." }
+        }
+        catch { $o.SonrakiDurum = 'Bilinmiyor'; $o.Aciklama = "Hata: $(Get-ErrText $_.Exception)" }
+        finally { if ($sc) { $sc.Dispose() } }
+        $results += $o
+    }
+    return $results
 }
 
 function Invoke-SccmClientAction {
@@ -443,14 +571,51 @@ function Invoke-SccmClientAction {
     param([string]$ComputerName, [string]$ActionName, [string[]]$ScheduleIds)
 
     $r = [pscustomobject]@{ Hostname = $ComputerName; Action = $ActionName; State = 'fail'; Result = ''; Detail = '' }
+    $reach = Get-HostReach -ComputerName $ComputerName
+    if (-not $reach.DnsOk)  { $r.Result = "DNS: $($reach.DnsText) - eylem gonderilemedi."; return $r }
+    if (-not $reach.Online) { $r.Result = "Cevrimdisi - eylem gonderilemedi. $($reach.Note)"; return $r }
 
-    $dns = Resolve-HostDns -ComputerName $ComputerName
-    if (-not $dns.Ok) {
-        $r.Result = "DNS: $($dns.Text) - eylem gonderilemedi."
+    $suffix = if ($reach.Identity -eq 'Dogrulandi') { '' } else { ' (cihaz kimligi dogrulanamadi)' }
+    $r.State = if ($reach.Identity -eq 'Dogrulandi') { 'ok' } else { 'warn' }
+
+    # V11 - Istemci onarimi: SMS_Client.RepairClient (ccmrepair.exe'yi arka planda baslatir; WinRM gerekmez)
+    if ($ScheduleIds[0] -eq '@REPAIR') {
+        try {
+            $null = Invoke-WmiMethod -ComputerName $ComputerName -Namespace 'root\ccm' -Class 'SMS_Client' -Name 'RepairClient' -ErrorAction Stop
+            $r.Result = "Onarim baslatildi$suffix - ccmrepair arka planda calisir (birkac dakika surer, ajan bu sirada yeniden baslar)."
+            $r.Detail = 'root\ccm SMS_Client.RepairClient cagrildi. Ilerleme: hedefte C:\Windows\CCM\Logs\ccmrepair.log'
+        }
+        catch {
+            $r.State = 'fail'
+            $r.Result = (Get-WmiFailureReason -ErrorRecord $_).Text
+            $r.Detail = "RepairClient: $($_.Exception.Message)`r`nAjan WMI'si cevap vermiyorsa once 'CcmExec yeniden baslat' deneyin; ajan hic yoksa ccmsetup ile kurulum gerekir."
+        }
         return $r
     }
-    if (-not (Test-HostOnline -ComputerName $ComputerName)) {
-        $r.Result = 'Cevrimdisi - eylem gonderilemedi (ping yanit vermiyor).'
+    # V11 - CcmExec (SMS Agent Host) yeniden baslatma: ServiceController (RPC/SCM)
+    if ($ScheduleIds[0] -eq '@RESTART') {
+        $sc = $null
+        try {
+            $sc = New-Object System.ServiceProcess.ServiceController ('CcmExec', $ComputerName)
+            $before = $sc.Status.ToString()
+            if ($sc.Status -ne 'Stopped') {
+                if ($sc.Status -ne 'StopPending') { $sc.Stop() }
+                $sc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(90))
+            }
+            $sc.Start()
+            try { $sc.WaitForStatus('Running', [TimeSpan]::FromSeconds(60)) } catch { }
+            $sc.Refresh()
+            $after = $sc.Status.ToString()
+            if ($after -ne 'Running') { $r.State = 'warn' }
+            $r.Result = "CcmExec: $before -> $after$suffix"
+            $r.Detail = 'SMS Agent Host (CcmExec) durdurulup baslatildi.'
+        }
+        catch {
+            $r.State = 'fail'
+            $err = Get-ErrText $_.Exception
+            $r.Result = if ($err -match 'was not found|bulunamad|1060') { 'SCCM ajani bulunmuyor (CcmExec servisi yok).' } else { "CcmExec yeniden baslatilamadi: $err" }
+        }
+        finally { if ($sc) { $sc.Dispose() } }
         return $r
     }
 
@@ -461,91 +626,99 @@ function Invoke-SccmClientAction {
             $sent += $id
         }
         catch {
-            $why = Get-WmiFailureReason -ErrorRecord $_
-            $r.Result = $why.Text
+            $r.State  = 'fail'
+            $r.Result = (Get-WmiFailureReason -ErrorRecord $_).Text
             $r.Detail = "Basarisiz ScheduleID: $id`r`n$($_.Exception.Message)"
             if ($sent.Count -gt 0) { $r.Detail += "`r`nOncesinde gonderilenler: $($sent -join ', ')" }
             return $r
         }
     }
-
-    $r.State  = 'ok'
-    $r.Result = 'Gonderildi'
+    $r.Result = "Gonderildi$suffix"
     $r.Detail = "Tetiklenen ScheduleID: $($sent -join ', ')"
     return $r
 }
 
 function Get-NoResponseVerdict {
-    # Script'ten cevap gelmediginde sebebi belirler:
-    #   cevrimdisi / SCCM ajani yok / cevrimici ama script calismadi
+    # Script'ten cevap gelmediginde sebebi belirler: cevrimdisi / IP baska cihazda / SCCM ajani yok / cevrimici ama calismadi
     param([string]$ComputerName, [int]$TimeoutSec)
 
-    $dns = Resolve-HostDns -ComputerName $ComputerName
-    if (-not $dns.Ok) {
-        return [pscustomobject]@{ State = 'fail'; Text = "Cevrimdisi oldugu icin script calismadi (DNS: $($dns.Text))." }
-    }
-    if (-not (Test-HostOnline -ComputerName $ComputerName)) {
-        return [pscustomobject]@{ State = 'fail'; Text = 'Cevrimdisi oldugu icin script calismadi (ping yanit vermiyor).' }
-    }
+    $reach = Get-HostReach -ComputerName $ComputerName
+    if (-not $reach.DnsOk)  { return [pscustomobject]@{ State = 'fail'; Text = "Cevrimdisi oldugu icin script calismadi (DNS: $($reach.DnsText))." } }
+    if (-not $reach.Online) { return [pscustomobject]@{ State = 'fail'; Text = "Cevrimdisi oldugu icin script calismadi. $($reach.Note)" } }
 
-    $svc = $null
-    try { $svc = Get-Service -ComputerName $ComputerName -Name 'CcmExec' -ErrorAction Stop }
-    catch {
-        if ($_.FullyQualifiedErrorId -like 'NoServiceFoundForGivenName*') {
-            return [pscustomobject]@{ State = 'fail'; Text = 'SCCM ajani bulunmuyor (CcmExec servisi yok).' }
-        }
-        return [pscustomobject]@{ State = 'warn'; Text = "Cevrimici - script calismadi (CcmExec sorgulanamadi: $($_.Exception.Message))." }
-    }
-
-    if ($svc.Status -ne 'Running') {
-        return [pscustomobject]@{ State = 'warn'; Text = "Cevrimici - script calismadi (CcmExec servisi $($svc.Status))." }
-    }
-    return [pscustomobject]@{ State = 'warn'; Text = "Cevrimici - script calismadi ($TimeoutSec sn icinde SCCM'den yanit gelmedi)." }
+    $cc = (Get-ServiceCheck -ComputerName $ComputerName).CcmExec
+    $pre = if ($reach.Identity -eq 'Dogrulandi') { 'Cevrimici' } else { 'Ping var (kimlik dogrulanamadi)' }
+    if ($cc -eq 'Yok')         { return [pscustomobject]@{ State = 'fail'; Text = 'SCCM ajani bulunmuyor (CcmExec servisi yok).' } }
+    if ($cc -eq 'Erisilemedi') { return [pscustomobject]@{ State = 'warn'; Text = "$pre - script calismadi (CcmExec sorgulanamadi)." } }
+    if ($cc -ne 'Running')     { return [pscustomobject]@{ State = 'warn'; Text = "$pre - script calismadi (CcmExec servisi $cc)." } }
+    return [pscustomobject]@{ State = 'warn'; Text = "$pre - script calismadi ($TimeoutSec sn icinde SCCM'den yanit gelmedi)." }
 }
 
-function Invoke-SccmScriptOnDevice {
-    # SMS Provider uzerinden "Run Script" (ClientOperation Type 135) baslatir ve
-    # sonucu SMS_ScriptsExecutionStatus uzerinden bekler.
-    param(
-        [string]$ComputerName,
-        [string]$SmsProvider,
-        [string]$SiteCode,
-        [string]$ScriptGuid,
-        [string]$ScriptName,
-        [string]$ParamB64,
-        [int]$TimeoutSec
-    )
+function Get-SccmDeviceMap {
+    # V2 - TOPLU SCCM KAYDI: SMS_R_System cihaz basina degil, $Chunk'lik parcalar halinde TEK sorguyla okunur
+    # (WQL'de IN yok: Name = 'a' OR Name = 'b' ...). Doner: kisa ad -> Get-SccmDevice ile ayni yapida kayit.
+    param([string[]]$Names, [string]$SmsProvider, [string]$SiteCode, [int]$Chunk = 100)
 
-    $r = [pscustomobject]@{ Hostname = $ComputerName; Action = "Script: $ScriptName"; State = 'fail'; Result = ''; Output = ''; ExitCode = $null; Detail = '' }
+    $map = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+    $shorts = @($Names | ForEach-Object { (([string]$_ -split '\.')[0]).Trim() } | Where-Object { $_ } | Sort-Object -Unique)
+    for ($i = 0; $i -lt $shorts.Count; $i += $Chunk) {
+        $part = @($shorts[$i..([Math]::Min($i + $Chunk, $shorts.Count) - 1)])
+        $w = (($part | ForEach-Object { "Name = '$(ConvertTo-WqlString $_)'" }) -join ' OR ')
+        $rows = $null; $err = ''
+        try {
+            $rows = @(Get-WmiObject -ComputerName $SmsProvider -Namespace "root\SMS\site_$SiteCode" -ErrorAction Stop `
+                    -Query "SELECT ResourceId, Name, Client, Active, Obsolete FROM SMS_R_System WHERE $w" |
+                ForEach-Object { [pscustomobject]@{ ResourceId = $_.ResourceId; Name = [string]$_.Name; Client = $_.Client; Active = $_.Active; Obsolete = $_.Obsolete } })
+        }
+        catch { $err = $_.Exception.Message }
+        foreach ($n in $part) {
+            if ($err) { $map[$n] = [pscustomobject]@{ Ok = $false; Error = $err; Cands = @(); Dev = $null }; continue }
+            $c = @($rows | Where-Object { [string]::Equals($_.Name, $n, [System.StringComparison]::OrdinalIgnoreCase) })
+            $map[$n] = [pscustomobject]@{ Ok = $true; Error = ''; Cands = $c; Dev = ($c | Where-Object { $_.Client -eq 1 -and $_.Obsolete -ne 1 } | Select-Object -First 1) }
+        }
+    }
+    return $map
+}
+
+function Get-SccmDevice {
+    # SMS_R_System'de cihaz kaydi. Doner: Ok, Error, Cands (tum adaylar), Dev (istemcisi olan aktif kayit)
+    # -Info verilmisse (toplu sorgudan gelen kayit, Get-SccmDeviceMap) SMS Provider'a HIC gidilmez.
+    param([string]$ComputerName, [string]$SmsProvider, [string]$SiteCode, $Info)
+    if ($Info) { return $Info }
+    $short = ConvertTo-WqlString (($ComputerName -split '\.')[0])
+    try {
+        $c = @(Get-WmiObject -ComputerName $SmsProvider -Namespace "root\SMS\site_$SiteCode" -ErrorAction Stop `
+                -Query "SELECT ResourceId, Name, Client, Active, Obsolete FROM SMS_R_System WHERE Name = '$short'")
+        return [pscustomobject]@{ Ok = $true; Error = ''; Cands = $c; Dev = ($c | Where-Object { $_.Client -eq 1 -and $_.Obsolete -ne 1 } | Select-Object -First 1) }
+    }
+    catch { return [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message; Cands = @(); Dev = $null } }
+}
+
+function Send-SccmScript {
+    # SMS Provider uzerinden "Run Script" (ClientOperation Type 135) BASLATIR; sonucu BEKLEMEZ.
+    # Sonuc, ana penceredeki TOPLU yoklayicidan (Get-ScriptPollStatus, 4 sn'de bir tum bekleyenler icin tek sorgu) gelir.
+    # Pending = $true ise gonderim basarili, ResourceId / OperationId / SentAt yoklama icin doludur.
+    param([string]$ComputerName, [string]$SmsProvider, [string]$SiteCode, [string]$ScriptGuid, [string]$ScriptName, [string]$ParamB64, [int]$TimeoutSec, $SccmInfo)
+
+    $r = [pscustomobject]@{
+        Action = "Script: $ScriptName"; State = 'fail'; Result = ''; Output = ''; ExitCode = $null; Detail = ''
+        Pending = $false; ResourceId = $null; OperationId = $null; SentAt = $null
+        SmsProvider = $SmsProvider; SiteCode = $SiteCode; ScriptGuid = $ScriptGuid; TimeoutSec = $TimeoutSec
+    }
     $ns = "root\SMS\site_$SiteCode"
-    $short = ($ComputerName -split '\.')[0]
 
     # ---- 1) Cihaz SCCM'de kayitli mi, istemci (ajan) var mi? ----
-    try {
-        $cands = @(Get-WmiObject -ComputerName $SmsProvider -Namespace $ns -ErrorAction Stop `
-            -Query "SELECT ResourceId, Name, Client, Active, Obsolete FROM SMS_R_System WHERE Name = '$short'")
-    }
-    catch {
-        $r.Result = "SCCM sorgusu basarisiz: $($_.Exception.Message)"
+    $q = Get-SccmDevice -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -Info $SccmInfo
+    if (-not $q.Ok) { $r.Result = "SCCM sorgusu basarisiz: $($q.Error)"; return $r }
+    if (-not $q.Dev) {
+        $r.Result = if ($q.Cands.Count -gt 0) { 'SCCM ajani bulunmuyor (cihaz kaydi var ama istemci yuklu degil/obsolete).' } else { "SCCM ajani bulunmuyor (cihaz SCCM'de kayitli degil)." }
         return $r
     }
-
-    $dev = $cands | Where-Object { $_.Client -eq 1 -and $_.Obsolete -ne 1 } | Select-Object -First 1
-    if (-not $dev) {
-        if ($cands.Count -gt 0) {
-            $r.Result = 'SCCM ajani bulunmuyor (cihaz kaydi var ama istemci yuklu degil/obsolete).'
-        }
-        else {
-            $r.Result = "SCCM ajani bulunmuyor (cihaz SCCM'de kayitli degil)."
-        }
-        return $r
-    }
-    $rid = [uint32]$dev.ResourceId
+    $rid = [uint32]$q.Dev.ResourceId
 
     # ---- 2) Scripti gonder ----
-    $op = $null
     try {
-        $mc = [WmiClass]"\\$SmsProvider\root\SMS\site_${SiteCode}:SMS_ClientOperation"
+        $mc = [WmiClass]"\\$SmsProvider\${ns}:SMS_ClientOperation"
         $in = $mc.psbase.GetMethodParameters('InitiateClientOperationEx')
         $in.Param = $ParamB64
         $in.RandomizationWindow = [uint32]0
@@ -553,373 +726,221 @@ function Invoke-SccmScriptOnDevice {
         $in.TargetResourceIDs = [uint32[]]@($rid)
         $in.Type = [uint32]135
         $res = $mc.InvokeMethod('InitiateClientOperationEx', $in, $null)
-        if ($res.OperationID) { $op = [uint32]$res.OperationID }
-        if ($res.ReturnValue -ne 0) {
-            $r.Result = "Script gonderilemedi (ReturnValue=$($res.ReturnValue))."
-            return $r
-        }
+        if ($res.ReturnValue -ne 0) { $r.Result = "Script gonderilemedi (ReturnValue=$($res.ReturnValue))."; return $r }
+        if ($res.OperationID) { $r.OperationId = [uint32]$res.OperationID }
     }
     catch {
         $why = Get-WmiFailureReason -ErrorRecord $_
-        if ($why.Kind -eq 'Access') { $r.Result = 'Script gonderilemedi: SCCM yetkisi yok (Run Script izni gerekli).' }
-        else { $r.Result = "Script gonderilemedi: $($_.Exception.Message)" }
+        $r.Result = if ($why.Kind -eq 'Access') { 'Script gonderilemedi: SCCM yetkisi yok (Run Script izni gerekli).' } else { "Script gonderilemedi: $($_.Exception.Message)" }
         return $r
     }
-
-    # ---- 3) Sonucu bekle ----
-    $start    = Get-Date
-    $deadline = $start.AddSeconds($TimeoutSec)
-    $taskId   = $null
-    $status   = $null
-    $seen     = $null
-
-    while ((Get-Date) -lt $deadline -and -not $status) {
-        Start-Sleep -Seconds 4
-
-        if (-not $taskId -and $op) {
-            try {
-                $t = @(Get-WmiObject -ComputerName $SmsProvider -Namespace $ns -ErrorAction Stop `
-                    -Query "SELECT TaskID FROM SMS_ScriptsExecutionTask WHERE ClientOperationId = $op")
-                if ($t.Count -gt 0) { $taskId = [string]$t[0].TaskID }
-            }
-            catch { }
-        }
-
-        $rows = @()
-        try {
-            $rows = @(Get-WmiObject -ComputerName $SmsProvider -Namespace $ns -ErrorAction Stop `
-                -Query "SELECT * FROM SMS_ScriptsExecutionStatus WHERE ScriptGuid = '$ScriptGuid' AND ResourceID = $rid")
-        }
-        catch { }
-
-        foreach ($row in $rows) {
-            # Bu satir BU calistirmaya mi ait? (eski calistirmalarin sonucunu almamak icin)
-            $names = @($row.PSObject.Properties | ForEach-Object { $_.Name })
-            $mine = $false
-            if ($taskId -and ($names -contains 'TaskID') -and $row.TaskID) {
-                $mine = ([string]$row.TaskID -eq $taskId)
-            }
-            elseif (($names -contains 'ClientOperationId') -and $row.ClientOperationId -and $op) {
-                $mine = ([uint32]$row.ClientOperationId -eq $op)
-            }
-            elseif (($names -contains 'LastUpdateTime') -and $row.LastUpdateTime) {
-                try { $mine = ([System.Management.ManagementDateTimeConverter]::ToDateTime([string]$row.LastUpdateTime) -ge $start.AddMinutes(-1)) }
-                catch { $mine = $false }
-            }
-            if (-not $mine) { continue }
-
-            $seen = $row
-            if ($null -ne $row.ScriptExitCode -or -not [string]::IsNullOrEmpty([string]$row.ScriptOutput)) {
-                $status = $row
-                break
-            }
-        }
-    }
-
-    # ---- 4) Sonuc ----
-    if ($status) {
-        $code    = $status.ScriptExitCode
-        $outText = ([string]$status.ScriptOutput).TrimStart([char]0xFEFF).Trim()
-
-        # Grid'e sadece CIKTI yazilir (satirlar ' | ' ile birlestirilir); exit code / OperationID Detay'dadir.
-        $oneLine = ((($outText -split "`r`n|`n|`r") | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | ')
-
-        $r.Output   = $outText
-        $r.ExitCode = $code
-        $r.Detail   = "OperationID: $op`r`nExit code: $code`r`nCikti:`r`n$outText"
-
-        $ok = ($null -eq $code) -or ([int]$code -eq 0)
-        $r.State = if ($ok) { 'ok' } else { 'warn' }
-
-        if ($outText)    { $r.Result = $oneLine }
-        elseif ($ok)     { $r.Result = 'Script calisti, cikti bos.' }
-        else             { $r.Result = "Script calisti, cikti bos (exit code $code)." }
-        return $r
-    }
-
-    $v = Get-NoResponseVerdict -ComputerName $ComputerName -TimeoutSec $TimeoutSec
-    $r.State  = $v.State
-    $r.Result = $v.Text
-    $r.Detail = "OperationID: $op"
-    if ($seen) { $r.Detail += "`r`nSCCM'de durum kaydi goruldu ancak sonuc/cikti gelmedi." }
+    $r.Pending = $true; $r.ResourceId = $rid; $r.SentAt = Get-Date
+    $r.State = 'pending'; $r.Result = 'Gonderildi, sonuc bekleniyor'
     return $r
+}
+
+function Select-ScriptStatusRow {
+    # SMS_ScriptsExecutionStatus satirlarindan BU calistirmaya ait olani secer (eski calistirmalarin sonucu alinmaz).
+    # Eslesme sirasi: TaskID -> ClientOperationId -> LastUpdateTime (sema surumler arasinda farkli olabildigi icin).
+    param([object[]]$Rows, $TaskId, $Op, [datetime]$Start)
+    $seen = $false
+    foreach ($row in $Rows) {
+        if (-not $row) { continue }
+        $names = @($row.PSObject.Properties | ForEach-Object { $_.Name })
+        $mine = $false
+        if ($TaskId -and ($names -contains 'TaskID') -and $row.TaskID) { $mine = ([string]$row.TaskID -eq [string]$TaskId) }
+        elseif (($names -contains 'ClientOperationId') -and $row.ClientOperationId -and $Op) { $mine = ([uint32]$row.ClientOperationId -eq [uint32]$Op) }
+        elseif (($names -contains 'LastUpdateTime') -and $row.LastUpdateTime) {
+            try { $mine = ([System.Management.ManagementDateTimeConverter]::ToDateTime([string]$row.LastUpdateTime) -ge $Start.AddMinutes(-1)) } catch { }
+        }
+        if (-not $mine) { continue }
+        $seen = $true
+        if ($null -ne $row.ScriptExitCode -or -not [string]::IsNullOrEmpty([string]$row.ScriptOutput)) { return [pscustomobject]@{ Seen = $true; Status = $row } }
+    }
+    return [pscustomobject]@{ Seen = $seen; Status = $null }
+}
+
+function Get-ScriptPollStatus {
+    # TOPLU YOKLAMA: bekleyen TUM cihazlar icin SMS Provider'a cihaz basina degil, grup basina TEK sorgu atar
+    # (WQL'de IN yok: 'ResourceID = a OR ResourceID = b ...'; sorgu boyu icin $Chunk'lik parcalar).
+    # Items: Id, Provider, SiteCode, Guid, Rid, Op, TaskId, Start. Doner: Id, TaskId, Seen, Done, ExitCode, Output, Error
+    param([object[]]$Items, [int]$Chunk = 100)
+
+    $out = New-Object System.Collections.ArrayList
+    foreach ($g in @($Items | Group-Object -Property { "$($_.Provider)|$($_.SiteCode)|$($_.Guid)" })) {
+        $f   = $g.Group[0]
+        $ns  = "root\SMS\site_$($f.SiteCode)"
+        $grp = @($g.Group)
+        for ($i = 0; $i -lt $grp.Count; $i += $Chunk) {
+            $part = @($grp[$i..([Math]::Min($i + $Chunk, $grp.Count) - 1)])
+
+            # TaskID'si henuz bilinmeyenler icin tek sorgu
+            $taskMap = @{}
+            $noTask = @($part | Where-Object { -not $_.TaskId -and $_.Op })
+            if ($noTask.Count -gt 0) {
+                $w = (($noTask | ForEach-Object { "ClientOperationId = $([uint32]$_.Op)" }) -join ' OR ')
+                try {
+                    foreach ($t in @(Get-WmiObject -ComputerName $f.Provider -Namespace $ns -ErrorAction Stop -Query "SELECT TaskID, ClientOperationId FROM SMS_ScriptsExecutionTask WHERE $w")) {
+                        $taskMap[[string]$t.ClientOperationId] = [string]$t.TaskID
+                    }
+                }
+                catch { }
+            }
+
+            # Sonuc satirlari: tek sorgu
+            $byRid = @{}
+            $err = ''
+            $w = (($part | ForEach-Object { "ResourceID = $([uint32]$_.Rid)" }) -join ' OR ')
+            try {
+                foreach ($row in @(Get-WmiObject -ComputerName $f.Provider -Namespace $ns -ErrorAction Stop `
+                            -Query "SELECT * FROM SMS_ScriptsExecutionStatus WHERE ScriptGuid = '$(ConvertTo-WqlString $f.Guid)' AND ($w)")) {
+                    $k = [string]$row.ResourceID
+                    if (-not $byRid.ContainsKey($k)) { $byRid[$k] = New-Object System.Collections.ArrayList }
+                    [void]$byRid[$k].Add($row)
+                }
+            }
+            catch { $err = $_.Exception.Message }
+
+            foreach ($it in $part) {
+                $tid = if ($it.TaskId) { $it.TaskId } elseif ($it.Op -and $taskMap.ContainsKey([string]$it.Op)) { $taskMap[[string]$it.Op] } else { $null }
+                $m = Select-ScriptStatusRow -Rows @($byRid[[string]$it.Rid]) -TaskId $tid -Op $it.Op -Start $it.Start
+                [void]$out.Add([pscustomobject]@{
+                    Id = $it.Id; TaskId = $tid; Seen = [bool]$m.Seen; Done = [bool]$m.Status; Error = $err
+                    ExitCode = $(if ($m.Status) { $m.Status.ScriptExitCode } else { $null })
+                    Output   = $(if ($m.Status) { [string]$m.Status.ScriptOutput } else { '' })
+                })
+            }
+        }
+    }
+    return $out
 }
 
 function Get-AdStructureStatus {
-    # AD YAPISI KONTROLU: DNS + Cevrimici (ping) + Active Directory (var mi, Enabled/Disabled, Last Logon).
-    # Servis kontrolu YAPMAZ. Script gonderiminde otomatik, ayrica tek basina da calistirilabilir.
-    param([string]$ComputerName, [bool]$QueryAllDCs = $false)
+    # AD YAPISI KONTROLU: DNS + Cevrimici (ping + kimlik) + AD (var mi, Enabled/Disabled, Last Logon). Servis kontrolu YAPMAZ.
+    param([string]$ComputerName)
 
-    $row = [pscustomobject]@{
-        Hostname     = $ComputerName
-        DnsStatus    = ''
-        IsOnline     = $false
-        AdStatus     = ''
-        LastLogon    = ''
-        ErrorMessage = ''
-        State        = 'fail'
+    $reach = Get-HostReach -ComputerName $ComputerName
+    $ad    = Get-AdComputerInfo -ComputerName $ComputerName
+    $state = if (-not $reach.Online) { 'fail' } elseif ($ad.Status -ne 'Enabled' -or $reach.Identity -ne 'Dogrulandi') { 'warn' } else { 'ok' }
+    return [pscustomobject]@{
+        Hostname = $ComputerName; DnsStatus = $reach.DnsText; IsOnline = $reach.Online; OnlineText = $reach.OnlineText
+        Identity = $reach.Identity; AdStatus = $ad.Status; LastLogon = $ad.LastLogon
+        ErrorMessage = (@($ad.Detail, $reach.Note | Where-Object { $_ }) -join ' | '); State = $state; ReachNote = $reach.Note
     }
-    $errs = @()
-
-    $dns = Resolve-HostDns -ComputerName $ComputerName
-    $row.DnsStatus = $dns.Text
-
-    $ad = Get-AdComputerInfo -ComputerName $ComputerName -QueryAllDCs $QueryAllDCs
-    $row.AdStatus  = $ad.Status
-    $row.LastLogon = $ad.LastLogon
-    if ($ad.Detail) { $errs += $ad.Detail }
-
-    if (-not $dns.Ok) {
-        $errs += 'DNS cozumlenemedi, ping kontrolu yapilmadi'
-    }
-    else {
-        $row.IsOnline = [bool](Test-HostOnline -ComputerName $ComputerName)
-        if (-not $row.IsOnline) { $errs += 'Makine yanit vermiyor (ping basarisiz)' }
-    }
-
-    $row.ErrorMessage = ($errs -join ' | ')
-    if (-not $dns.Ok -or -not $row.IsOnline) { $row.State = 'fail' }
-    elseif ($ad.Status -ne 'Enabled')         { $row.State = 'warn' }
-    else                                      { $row.State = 'ok' }
-    return $row
 }
 
-function Get-ServiceCheck {
-    # Istenen servislerin + CcmExec'in durumunu tek RPC cagrisi ile alir (Panel 1 script gonderiminde kullanilir).
-    param([string]$ComputerName, [string[]]$ServiceNames)
-
-    $r = [pscustomobject]@{ Running = ''; NotRunning = ''; CcmExec = ''; ServiceDetail = @(); Note = '' }
-    $all = $null
-    try { $all = @(Get-Service -ComputerName $ComputerName -ErrorAction Stop) }
-    catch { $r.Note = "Servis listesi alinamadi: $($_.Exception.Message)" }
-
-    $detail = @()
-    foreach ($sn in $ServiceNames) {
-        $n = "$sn".Trim()
-        if (-not $n) { continue }
-        if ($null -eq $all) {
-            $detail += [pscustomobject]@{ Name = $n; Status = 'Erisilemedi' }
-            continue
-        }
-        $m = $all | Where-Object { $_.Name -eq $n -or $_.DisplayName -eq $n } | Select-Object -First 1
-        if ($m) { $detail += [pscustomobject]@{ Name = $n; Status = $m.Status.ToString() } }
-        else    { $detail += [pscustomobject]@{ Name = $n; Status = 'NotFound' } }
+function New-SkippedScript {
+    # Cevrimdisi cihaza SCCM scripti GONDERILMEZ (sonucu beklemek de anlamsiz); Send-SccmScript ile ayni yapida sonuc doner.
+    param([string]$ScriptName, [string]$Why)
+    return [pscustomobject]@{
+        Action = "Script: $ScriptName"; State = 'fail'; Result = "Script gonderilmedi - cihaz cevrimdisi ($Why)"; Output = ''; ExitCode = $null
+        Detail = "Cevrimdisi oldugu icin SCCM'e gonderim yapilmadi. $Why"; Pending = $false; ResourceId = $null; OperationId = $null; SentAt = $null
     }
-    $r.ServiceDetail = $detail
-    $r.Running    = (($detail | Where-Object { $_.Status -eq 'Running' } | ForEach-Object { $_.Name }) -join ', ')
-    $r.NotRunning = (($detail | Where-Object { $_.Status -ne 'Running' } | ForEach-Object { "$($_.Name)($($_.Status))" }) -join ', ')
-
-    if ($null -eq $all) { $r.CcmExec = 'Erisilemedi' }
-    else {
-        $cc = $all | Where-Object { $_.Name -eq 'CcmExec' } | Select-Object -First 1
-        $r.CcmExec = if ($cc) { $cc.Status.ToString() } else { 'Yok' }
-    }
-    return $r
 }
 
 function Invoke-ScriptWithAdCheck {
-    # Once AD yapisi kontrolu (DNS/ping/AD) + servis kontrolu, sonra SCCM script gonderimi. Tek sonuc nesnesi doner.
-    param(
-        [string]$ComputerName,
-        [string]$SmsProvider,
-        [string]$SiteCode,
-        [string]$ScriptGuid,
-        [string]$ScriptName,
-        [string]$ParamB64,
-        [int]$TimeoutSec,
-        [bool]$QueryAllDCs = $false,
-        [string[]]$ServiceNames = @()
-    )
+    # PANEL 1: once AD yapisi kontrolu (DNS/ping/kimlik/AD) + servis kontrolu, sonra SCCM script GONDERIMI (sonuc toplu yoklamadan).
+    param([string]$ComputerName, [string]$SmsProvider, [string]$SiteCode, [string]$ScriptGuid, [string]$ScriptName, [string]$ParamB64, [int]$TimeoutSec, [string[]]$ServiceNames = @(), $SccmInfo)
 
-    $ad = Get-AdStructureStatus -ComputerName $ComputerName -QueryAllDCs $QueryAllDCs
+    $ad = Get-AdStructureStatus -ComputerName $ComputerName
+    if ($ad.IsOnline -and @($ServiceNames).Count -gt 0) { $svc = Get-ServiceCheck -ComputerName $ComputerName -ServiceNames $ServiceNames }
+    else { $svc = [pscustomobject]@{ Running = ''; NotRunning = ''; CcmExec = $(if (-not $ad.IsOnline) { 'Kontrol edilemedi (cevrimdisi)' } else { '' }); ServiceDetail = @(); Note = '' } }
 
-    if ($ad.IsOnline -and @($ServiceNames).Count -gt 0) {
-        $svc = Get-ServiceCheck -ComputerName $ComputerName -ServiceNames $ServiceNames
+    if ($ad.IsOnline) {
+        $sr = Send-SccmScript -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode `
+            -ScriptGuid $ScriptGuid -ScriptName $ScriptName -ParamB64 $ParamB64 -TimeoutSec $TimeoutSec -SccmInfo $SccmInfo
     }
-    else {
-        $svc = [pscustomobject]@{ Running = ''; NotRunning = ''; CcmExec = $(if (-not $ad.IsOnline) { 'Kontrol edilemedi (cevrimdisi)' } else { '' }); ServiceDetail = @(); Note = '' }
-    }
-
-    $sr = Invoke-SccmScriptOnDevice -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode `
-        -ScriptGuid $ScriptGuid -ScriptName $ScriptName -ParamB64 $ParamB64 -TimeoutSec $TimeoutSec
+    else { $sr = New-SkippedScript -ScriptName $ScriptName -Why $(if ($ad.ReachNote) { $ad.ReachNote } else { $ad.OnlineText }) }
 
     return [pscustomobject]@{
-        Hostname      = $ComputerName
-        DnsStatus     = $ad.DnsStatus
-        IsOnline      = $ad.IsOnline
-        AdStatus      = $ad.AdStatus
-        LastLogon     = $ad.LastLogon
-        AdNote        = $ad.ErrorMessage
-        Running       = $svc.Running
-        NotRunning    = $svc.NotRunning
-        CcmExec       = $svc.CcmExec
-        ServiceDetail = $svc.ServiceDetail
-        SvcNote       = $svc.Note
-        Action        = $sr.Action
-        State         = $sr.State
-        Result        = $sr.Result
-        Output        = $sr.Output
-        ExitCode      = $sr.ExitCode
-        Detail        = $sr.Detail
+        Hostname = $ComputerName; DnsStatus = $ad.DnsStatus; IsOnline = $ad.IsOnline; OnlineText = $ad.OnlineText
+        AdStatus = $ad.AdStatus; LastLogon = $ad.LastLogon; AdNote = $ad.ErrorMessage
+        Running = $svc.Running; NotRunning = $svc.NotRunning; CcmExec = $svc.CcmExec; ServiceDetail = $svc.ServiceDetail; SvcNote = $svc.Note
+        Action = $sr.Action; State = $sr.State; Result = $sr.Result; Output = $sr.Output; ExitCode = $sr.ExitCode; Detail = $sr.Detail
+        Pending = $sr.Pending; ResourceId = $sr.ResourceId; OperationId = $sr.OperationId; SentAt = $sr.SentAt
+        SmsProvider = $SmsProvider; SiteCode = $SiteCode; ScriptGuid = $ScriptGuid; TimeoutSec = $TimeoutSec
     }
 }
 
 function Get-SccmRegistration {
     # SCCM sitesinde cihaz kaydi + istemci (ajan) durumu (SMS Provider WMI sorgusu).
-    param([string]$ComputerName, [string]$SmsProvider, [string]$SiteCode)
+    param([string]$ComputerName, [string]$SmsProvider, [string]$SiteCode, $SccmInfo)
 
-    if ([string]::IsNullOrWhiteSpace($SmsProvider) -or [string]::IsNullOrWhiteSpace($SiteCode)) {
-        return 'Sorgulanmadi (SCCM baglantisi yok)'
-    }
-    $short = ($ComputerName -split '\.')[0]
-    try {
-        $cands = @(Get-WmiObject -ComputerName $SmsProvider -Namespace "root\SMS\site_$SiteCode" -ErrorAction Stop `
-            -Query "SELECT ResourceId, Name, Client, Active, Obsolete FROM SMS_R_System WHERE Name = '$short'")
-    }
-    catch { return "Sorgulanamadi: $($_.Exception.Message)" }
-
-    if ($cands.Count -eq 0) { return 'SCCM de kayitli degil' }
-    $ok = $cands | Where-Object { $_.Client -eq 1 -and $_.Obsolete -ne 1 } | Select-Object -First 1
-    if ($ok) {
-        if ($ok.Active -eq 1) { return 'Client yuklu (Active)' }
-        return 'Client yuklu (Inactive)'
-    }
+    if ([string]::IsNullOrWhiteSpace($SmsProvider) -or [string]::IsNullOrWhiteSpace($SiteCode)) { return 'Sorgulanmadi (SCCM baglantisi yok)' }
+    $q = Get-SccmDevice -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -Info $SccmInfo
+    if (-not $q.Ok) { return "Sorgulanamadi: $($q.Error)" }
+    if ($q.Cands.Count -eq 0) { return 'SCCM de kayitli degil' }
+    if ($q.Dev) { if ($q.Dev.Active -eq 1) { return 'Client yuklu (Active)' } else { return 'Client yuklu (Inactive)' } }
     return 'Kayit var, client yok / obsolete'
 }
 
 function Get-ParserHostCheck {
-    # PANEL 2 icin kontrol: DNS + ping + AD (Enabled/Disabled/Last Logon) + CcmExec servisi + SCCM kaydi.
+    # PANEL 2 icin kontrol: DNS + ping + kimlik + AD + SERVISLER (1. bolumdeki liste) + CcmExec + SCCM kaydi.
     # Panel 1'in sonuc tablosuna / detaylarina DOKUNMAZ; sadece nesne dondurur.
-    param([string]$ComputerName, [string]$SmsProvider = '', [string]$SiteCode = '', [bool]$QueryAllDCs = $false)
+    param([string]$ComputerName, [string]$SmsProvider = '', [string]$SiteCode = '', [string[]]$ServiceNames = @(), $SccmInfo)
 
+    $reach = Get-HostReach -ComputerName $ComputerName
+    $ad    = Get-AdComputerInfo -ComputerName $ComputerName
     $c = [pscustomobject]@{
-        Hostname  = $ComputerName
-        DnsStatus = ''
-        IsOnline  = $false
-        AdStatus  = ''
-        LastLogon = ''
-        CcmExec   = ''
-        SccmKayit = ''
-        Note      = ''
+        Hostname = $ComputerName; DnsStatus = $reach.DnsText; IsOnline = $reach.Online; OnlineText = $reach.OnlineText
+        AdStatus = $ad.Status; LastLogon = $ad.LastLogon; Running = ''; NotRunning = ''; CcmExec = ''; ServiceDetail = @()
+        SccmKayit = (Get-SccmRegistration -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -SccmInfo $SccmInfo); Note = ''
     }
-    $notes = @()
+    $notes = @($ad.Detail, $reach.Note | Where-Object { $_ })
+    $c | Add-Member -NotePropertyName ReachNote -NotePropertyValue $reach.Note
 
-    $dns = Resolve-HostDns -ComputerName $ComputerName
-    $c.DnsStatus = $dns.Text
-
-    $ad = Get-AdComputerInfo -ComputerName $ComputerName -QueryAllDCs $QueryAllDCs
-    $c.AdStatus  = $ad.Status
-    $c.LastLogon = $ad.LastLogon
-    if ($ad.Detail) { $notes += $ad.Detail }
-
-    $c.SccmKayit = Get-SccmRegistration -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode
-
-    if (-not $dns.Ok) {
-        $c.CcmExec = 'Kontrol edilemedi (DNS)'
-        $notes += 'DNS cozumlenemedi, ping / CcmExec kontrolu yapilmadi'
-        $c.Note = ($notes -join ' | ')
-        return $c
-    }
-
-    $c.IsOnline = [bool](Test-HostOnline -ComputerName $ComputerName)
-    if (-not $c.IsOnline) {
-        $c.CcmExec = 'Kontrol edilemedi (cevrimdisi)'
-        $notes += 'Makine yanit vermiyor (ping basarisiz)'
-        $c.Note = ($notes -join ' | ')
-        return $c
-    }
-
-    try {
-        $svc = Get-Service -ComputerName $ComputerName -Name 'CcmExec' -ErrorAction Stop
-        $c.CcmExec = $svc.Status.ToString()
-    }
-    catch {
-        if ($_.FullyQualifiedErrorId -like 'NoServiceFoundForGivenName*') { $c.CcmExec = 'Yok' }
-        else {
-            $c.CcmExec = 'Erisilemedi'
-            $notes += "CcmExec sorgulanamadi: $($_.Exception.Message)"
-        }
+    if (-not $reach.DnsOk) { $c.CcmExec = $c.Running = $c.NotRunning = 'Kontrol edilemedi (DNS)' }
+    elseif (-not $reach.Online) { $c.CcmExec = $c.Running = $c.NotRunning = 'Kontrol edilemedi (cevrimdisi)' }
+    else {
+        $svc = Get-ServiceCheck -ComputerName $ComputerName -ServiceNames $ServiceNames
+        $c.CcmExec = $svc.CcmExec; $c.Running = $svc.Running; $c.NotRunning = $svc.NotRunning; $c.ServiceDetail = $svc.ServiceDetail
+        if ($svc.Note) { $notes += $svc.Note }
     }
     $c.Note = ($notes -join ' | ')
     return $c
 }
 
 function Invoke-ParserScriptRun {
-    # PANEL 2: once DNS/AD/SCCM ajan kontrolu, sonra SCCM script gonderimi. Tek sonuc nesnesi doner.
-    param(
-        [string]$ComputerName,
-        [string]$SmsProvider,
-        [string]$SiteCode,
-        [string]$ScriptGuid,
-        [string]$ScriptName,
-        [string]$ParamB64,
-        [int]$TimeoutSec,
-        [bool]$QueryAllDCs = $false
-    )
+    # PANEL 2: once DNS/AD/servis/SCCM ajan kontrolu, sonra SCCM script GONDERIMI (sonuc toplu yoklamadan).
+    param([string]$ComputerName, [string]$SmsProvider, [string]$SiteCode, [string]$ScriptGuid, [string]$ScriptName, [string]$ParamB64, [int]$TimeoutSec, [string[]]$ServiceNames = @(), $SccmInfo)
 
-    $chk = Get-ParserHostCheck -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -QueryAllDCs $QueryAllDCs
-    $sr  = Invoke-SccmScriptOnDevice -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode `
-        -ScriptGuid $ScriptGuid -ScriptName $ScriptName -ParamB64 $ParamB64 -TimeoutSec $TimeoutSec
-
+    $chk = Get-ParserHostCheck -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -ServiceNames $ServiceNames -SccmInfo $SccmInfo
+    if ($chk.IsOnline) {
+        $sr = Send-SccmScript -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode `
+            -ScriptGuid $ScriptGuid -ScriptName $ScriptName -ParamB64 $ParamB64 -TimeoutSec $TimeoutSec -SccmInfo $SccmInfo
+    }
+    else { $sr = New-SkippedScript -ScriptName $ScriptName -Why $(if ($chk.ReachNote) { $chk.ReachNote } else { $chk.OnlineText }) }
     return [pscustomobject]@{
-        Hostname = $ComputerName
-        Check    = $chk
-        Action   = $sr.Action
-        State    = $sr.State
-        Result   = $sr.Result
-        Output   = $sr.Output
-        ExitCode = $sr.ExitCode
-        Detail   = $sr.Detail
+        Hostname = $ComputerName; Check = $chk; Action = $sr.Action; State = $sr.State; Result = $sr.Result; Output = $sr.Output; ExitCode = $sr.ExitCode; Detail = $sr.Detail
+        Pending = $sr.Pending; ResourceId = $sr.ResourceId; OperationId = $sr.OperationId; SentAt = $sr.SentAt
+        SmsProvider = $SmsProvider; SiteCode = $SiteCode; ScriptGuid = $ScriptGuid; TimeoutSec = $TimeoutSec
     }
 }
+
 # ==================== SADECE ANA PENCERE FONKSIYONLARI ====================
 
 function New-WorkerScript {
-    # Verilen fonksiyonlarin kaynak kodunu runspace scriptinin basina gomer;
-    # boylece fonksiyon tanimlari TEK yerde tutulur.
-    param([string]$ParamLine, [string[]]$Funcs, [string]$CallLine)
-
-    $defs = foreach ($n in $Funcs) {
-        $body = (Get-Item -Path "function:$n").ScriptBlock.ToString()
-        "function $n {`n$body`n}"
-    }
+    # Ortak fonksiyonlarin kaynak kodunu worker scriptinin basina gomer; tanimlar TEK yerde tutulur.
+    param([string]$ParamLine, [string]$CallLine, [string[]]$Funcs)
+    $all = @('ConvertTo-WqlString', 'Get-ErrText', 'Test-Ping', 'Test-TcpPort', 'Get-NetBiosName', 'Get-WmiFailureReason', 'Get-WmiComputerName',
+        'Get-DnsWildcardIps', 'Resolve-HostDns', 'Get-HostReach', 'Convert-FileTimeSafe', 'Get-AdCacheIndex', 'Get-AdOuComputers', 'Get-AdComputerInfo', 'Get-ServiceCheck',
+        'Get-RemoteStatus', 'Start-RemoteFix', 'Invoke-SccmClientAction', 'Get-NoResponseVerdict', 'Get-SccmDevice', 'Send-SccmScript',
+        'Get-AdStructureStatus', 'New-SkippedScript', 'Invoke-ScriptWithAdCheck', 'Get-SccmRegistration', 'Get-ParserHostCheck', 'Invoke-ParserScriptRun')
+    $defs = foreach ($n in $(if ($Funcs) { $Funcs } else { $all })) { "function $n {`n$((Get-Item -Path "function:$n").ScriptBlock.ToString())`n}" }
     return [scriptblock]::Create("param($ParamLine)`n" + ($defs -join "`n") + "`n$CallLine")
 }
 
-$script:CheckWorker = New-WorkerScript `
-    -ParamLine '$ComputerName, $ServiceNames, $QueryAllDCs' `
-    -Funcs @('Test-HostOnline', 'Resolve-HostDns', 'Convert-FileTimeSafe', 'Get-AdComputerInfo', 'Get-RemoteStatus') `
-    -CallLine 'Get-RemoteStatus -ComputerName $ComputerName -ServiceNames $ServiceNames -QueryAllDCs $QueryAllDCs'
-
-$script:FixWorker = New-WorkerScript `
-    -ParamLine '$ComputerName, $ServiceDetail' `
-    -Funcs @('Start-RemoteFix') `
-    -CallLine 'Start-RemoteFix -ComputerName $ComputerName -ServiceDetail $ServiceDetail'
-
-$script:ActionWorker = New-WorkerScript `
-    -ParamLine '$ComputerName, $ActionName, $ScheduleIds' `
-    -Funcs @('Test-HostOnline', 'Resolve-HostDns', 'Get-WmiFailureReason', 'Invoke-SccmClientAction') `
-    -CallLine 'Invoke-SccmClientAction -ComputerName $ComputerName -ActionName $ActionName -ScheduleIds $ScheduleIds'
-
-$script:ScriptWorker = New-WorkerScript `
-    -ParamLine '$ComputerName, $SmsProvider, $SiteCode, $ScriptGuid, $ScriptName, $ParamB64, $TimeoutSec, $QueryAllDCs, $ServiceNames' `
-    -Funcs @('Test-HostOnline', 'Resolve-HostDns', 'Convert-FileTimeSafe', 'Get-AdComputerInfo', 'Get-AdStructureStatus', 'Get-ServiceCheck', 'Get-WmiFailureReason', 'Get-NoResponseVerdict', 'Invoke-SccmScriptOnDevice', 'Invoke-ScriptWithAdCheck') `
-    -CallLine 'Invoke-ScriptWithAdCheck -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -ScriptGuid $ScriptGuid -ScriptName $ScriptName -ParamB64 $ParamB64 -TimeoutSec $TimeoutSec -QueryAllDCs $QueryAllDCs -ServiceNames $ServiceNames'
-
-$script:AdWorker = New-WorkerScript `
-    -ParamLine '$ComputerName, $QueryAllDCs' `
-    -Funcs @('Test-HostOnline', 'Resolve-HostDns', 'Convert-FileTimeSafe', 'Get-AdComputerInfo', 'Get-AdStructureStatus') `
-    -CallLine 'Get-AdStructureStatus -ComputerName $ComputerName -QueryAllDCs $QueryAllDCs'
-
-$script:ParserCheckWorker = New-WorkerScript `
-    -ParamLine '$ComputerName, $SmsProvider, $SiteCode, $QueryAllDCs' `
-    -Funcs @('Test-HostOnline', 'Resolve-HostDns', 'Convert-FileTimeSafe', 'Get-AdComputerInfo', 'Get-SccmRegistration', 'Get-ParserHostCheck') `
-    -CallLine 'Get-ParserHostCheck -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -QueryAllDCs $QueryAllDCs'
-
-$script:ParserScriptWorker = New-WorkerScript `
-    -ParamLine '$ComputerName, $SmsProvider, $SiteCode, $ScriptGuid, $ScriptName, $ParamB64, $TimeoutSec, $QueryAllDCs' `
-    -Funcs @('Test-HostOnline', 'Resolve-HostDns', 'Convert-FileTimeSafe', 'Get-AdComputerInfo', 'Get-SccmRegistration', 'Get-ParserHostCheck', 'Get-WmiFailureReason', 'Get-NoResponseVerdict', 'Invoke-SccmScriptOnDevice', 'Invoke-ParserScriptRun') `
-    -CallLine 'Invoke-ParserScriptRun -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -ScriptGuid $ScriptGuid -ScriptName $ScriptName -ParamB64 $ParamB64 -TimeoutSec $TimeoutSec -QueryAllDCs $QueryAllDCs'
+$script:CheckWorker        = New-WorkerScript '$ComputerName, $ServiceNames' 'Get-RemoteStatus -ComputerName $ComputerName -ServiceNames $ServiceNames'
+$script:FixWorker          = New-WorkerScript '$ComputerName, $ServiceDetail' 'Start-RemoteFix -ComputerName $ComputerName -ServiceDetail $ServiceDetail'
+$script:ActionWorker       = New-WorkerScript '$ComputerName, $ActionName, $ScheduleIds' 'Invoke-SccmClientAction -ComputerName $ComputerName -ActionName $ActionName -ScheduleIds $ScheduleIds'
+$script:ScriptWorker       = New-WorkerScript '$ComputerName, $SmsProvider, $SiteCode, $ScriptGuid, $ScriptName, $ParamB64, $TimeoutSec, $ServiceNames, $SccmInfo' 'Invoke-ScriptWithAdCheck -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -ScriptGuid $ScriptGuid -ScriptName $ScriptName -ParamB64 $ParamB64 -TimeoutSec $TimeoutSec -ServiceNames $ServiceNames -SccmInfo $SccmInfo'
+$script:AdWorker           = New-WorkerScript '$ComputerName' 'Get-AdStructureStatus -ComputerName $ComputerName'
+$script:AdCacheWorker      = New-WorkerScript '$Domain, $SearchBases' 'Get-AdOuComputers -Domain $Domain -SearchBases $SearchBases'
+$script:ParserCheckWorker  = New-WorkerScript '$ComputerName, $SmsProvider, $SiteCode, $ServiceNames, $SccmInfo' 'Get-ParserHostCheck -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -ServiceNames $ServiceNames -SccmInfo $SccmInfo'
+$script:VerdictWorker      = New-WorkerScript '$ComputerName, $TimeoutSec' 'Get-NoResponseVerdict -ComputerName $ComputerName -TimeoutSec $TimeoutSec'
+$script:PollWorker         = New-WorkerScript '$Items' 'Get-ScriptPollStatus -Items $Items' @('ConvertTo-WqlString', 'Select-ScriptStatusRow', 'Get-ScriptPollStatus')
+$script:ParserScriptWorker = New-WorkerScript '$ComputerName, $SmsProvider, $SiteCode, $ScriptGuid, $ScriptName, $ParamB64, $TimeoutSec, $ServiceNames, $SccmInfo' 'Invoke-ParserScriptRun -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -ScriptGuid $ScriptGuid -ScriptName $ScriptName -ParamB64 $ParamB64 -TimeoutSec $TimeoutSec -ServiceNames $ServiceNames -SccmInfo $SccmInfo'
+$script:SccmMapWorker      = New-WorkerScript '$Names, $SmsProvider, $SiteCode' 'Get-SccmDeviceMap -Names $Names -SmsProvider $SmsProvider -SiteCode $SiteCode' @('ConvertTo-WqlString', 'Get-SccmDeviceMap')
 
 function Get-HostSummary {
     # Bir hostun servis baslatma sonuclarini tek satirlik metne cevirir.
@@ -944,13 +965,18 @@ function Get-HostSummary {
 # ---------- Veri klasoru / ayarlar / denetim kaydi ----------
 
 function Get-DataDir {
-    # Yol bilerek sabit kuruluyor (OneDrive klasor yonlendirmesinden etkilenmesin diye).
-    $dir = "C:\Users\$env:USERNAME\Desktop\ServiceStatus"
-    if (-not (Test-Path $dir)) { $null = New-Item -ItemType Directory -Path $dir -Force }
+    # Bilerek %USERPROFILE%\Desktop (GetFolderPath degil): OneDrive klasor yonlendirmesinden etkilenmesin.
+    $dir = Join-Path $env:USERPROFILE 'Desktop\ServiceStatus'
+    if (-not (Test-Path -LiteralPath $dir)) { $null = New-Item -ItemType Directory -Path $dir -Force }
     return $dir
 }
 
 function Get-SettingsFile { return (Join-Path (Get-DataDir) 'ClientToolSettings.json') }
+function Get-AdCacheFile  { return (Join-Path (Get-DataDir) 'AdComputerCache.csv') }
+
+# Paralel runspace'ler script degiskenlerini goremez; onbellek yolunu process geneli ortam degiskeniyle paylasiriz
+# (Get-AdCacheIndex bu degiskeni okur).
+$env:CLIENTTOOL_ADCACHE_FILE = Get-AdCacheFile
 
 function Write-ActionLog {
     param([string]$Hostname, [string]$Action, [string]$State, [string]$Text)
@@ -966,25 +992,29 @@ function Write-ActionLog {
 # ---------- Sonuc tablosu yardimcilari ----------
 
 $script:ResultsTable = New-Object System.Data.DataTable
+$script:ResultsTable.Locale = [System.Globalization.CultureInfo]::InvariantCulture   # tr-TR'de I/i eslesmesi icin
 foreach ($c in @('Hostname', 'DnsStatus', 'IsOnline', 'AdStatus', 'LastLogon', 'Running', 'NotRunning', 'CcmExec', 'LastAction', 'ActionResult', 'ErrorMessage', 'State')) {
     $null = $script:ResultsTable.Columns.Add($c)
 }
+$script:ResultsTable.PrimaryKey = @($script:ResultsTable.Columns['Hostname'])   # Rows.Find ile O(1) arama (CaseSensitive = false)
 $script:BindingSrc = New-Object System.Windows.Forms.BindingSource
 $script:BindingSrc.DataSource = $script:ResultsTable
 
 # Panel 2 (Update Parser) tablosu: 21 parser kolonu + 6 kontrol kolonu (DNS/Online/AD/LastLogon/CcmExec/SCCM) + KolonUyumu + SourceHost (gizli)
 $script:ParseTable = New-Object System.Data.DataTable
+$script:ParseTable.Locale = [System.Globalization.CultureInfo]::InvariantCulture
 foreach ($c in $script:ParserColumns) { $null = $script:ParseTable.Columns.Add($c) }
 foreach ($c in $script:ParserCheckColumns) { $null = $script:ParseTable.Columns.Add($c) }
 $null = $script:ParseTable.Columns.Add('KolonUyumu')
 $null = $script:ParseTable.Columns.Add('SourceHost')
+$null = $script:ParseTable.Columns.Add('Durum')   # V7: hesaplanan satir durumu (gizli; ozet cubugu / filtre / tekrar dene)
 $script:ParseBinding = New-Object System.Windows.Forms.BindingSource
 $script:ParseBinding.DataSource = $script:ParseTable
 
 function Get-GridRow {
     param([string]$Hostname)
-    $found = $script:ResultsTable.Select("Hostname = '" + $Hostname.Replace("'", "''") + "'")
-    if ($found.Count -gt 0) { return $found[0] }
+    $found = $script:ResultsTable.Rows.Find($Hostname)
+    if ($found) { return $found }
     $row = $script:ResultsTable.NewRow()
     $row['Hostname'] = $Hostname
     $script:ResultsTable.Rows.Add($row)
@@ -1004,7 +1034,6 @@ function Add-RowDetail {
 }
 
 # ---------- "Bekleniyor.." yer tutucu satirlari (Panel 1) ----------
-$script:PendingText = 'Bekleniyor..'
 
 function Set-GridPending {
     # Hedef makinelerin TUMUNU hemen tabloya ekler (yoksa satir olusturur, varsa yerinde gunceller);
@@ -1018,9 +1047,16 @@ function Set-GridPending {
     }
 }
 
+function Format-JobError {
+    param([string]$ErrorText)
+    if ($ErrorText -eq $script:CancelText) { return 'Iptal edildi' }
+    return "Islem hatasi: $ErrorText"
+}
+
 function Resolve-PendingCells {
-    # Islem hata verdigi / sonuc gelmedigi icin hala 'Bekleniyor..' kalan hucreleri doldurur.
-    param([string]$Hostname, [string]$Text = 'Alinamadi')
+    # Islem hata verdigi / iptal edildigi icin hala 'Bekleniyor..' kalan hucreleri doldurur.
+    param([string]$Hostname, [string]$ErrorText = '')
+    $Text = if ($ErrorText -eq $script:CancelText) { 'Iptal edildi' } else { 'Alinamadi' }
     $row = Get-GridRow -Hostname $Hostname
     foreach ($c in $script:ResultsTable.Columns) {
         if ([string]$row[$c.ColumnName] -eq $script:PendingText) { $row[$c.ColumnName] = $Text }
@@ -1044,7 +1080,7 @@ function Get-SharedPool {
 
 function Test-PanelBusy {
     param([int]$Panel)
-    return (@($script:ActiveRuns | Where-Object { $_.Panel -eq $Panel }).Count -gt 0)
+    return (@($script:ActiveRuns | Where-Object { $_.Panel -eq $Panel }).Count -gt 0 -or @($script:Prefetch | Where-Object { $_.Panel -eq $Panel }).Count -gt 0)
 }
 
 function Start-ParallelRun {
@@ -1053,7 +1089,8 @@ function Start-ParallelRun {
         [scriptblock]$Worker,
         [object[]]$Items,          # her biri: @{ Key = hostname; Params = @{...} }
         [string]$OnResultFn,
-        [int]$Panel = 1            # 1 = Panel 1 (kontrol/script), 2 = Panel 2 (update parser)
+        [int]$Panel = 1,           # 1 = Panel 1 (kontrol/script), 2 = Panel 2 (update parser)
+        [string]$Unit = 'makine'   # durum cubugundaki "N makine islendi" metni icin
     )
 
     $st = [pscustomobject]@{
@@ -1064,9 +1101,13 @@ function Start-ParallelRun {
         Done       = 0
         Title      = $Title
         OnResultFn = $OnResultFn
+        Unit       = $Unit
     }
     [void]$script:ActiveRuns.Add($st)
     Set-UiBusy -Panel $Panel -Busy $true
+    if ($Unit -eq 'makine') {   # V6: tekrar deneme icin son islem (AD onbellek guncellemesi haric)
+        $script:LastOp[$Panel] = [pscustomobject]@{ Items = @($Items); RunArgs = @{ Title = ($Title -replace ' - tekrar$', ''); Worker = $Worker; OnResultFn = $OnResultFn; Panel = $Panel; Unit = $Unit } }
+    }
 
     $jobs = New-Object System.Collections.ArrayList
     foreach ($it in $Items) {
@@ -1083,49 +1124,234 @@ function Start-ParallelRun {
     if (-not $script:RunTimer.Enabled) { $script:RunTimer.Start() }
 }
 
+function Complete-Job {
+    # Bitmis isin ciktisini / hatasini alir ve PowerShell nesnesini birakir.
+    param($Job)
+    $out = @(); $err = ''
+    try { $out = @($Job.PS.EndInvoke($Job.Async)) } catch { $err = $_.Exception.Message }
+    if ($out.Count -eq 0 -and -not $err -and $Job.PS.Streams.Error.Count -gt 0) { $err = $Job.PS.Streams.Error[0].ToString() }
+    $Job.PS.Dispose()
+    return [pscustomobject]@{ Out = $out; Err = $err }
+}
+
+function Invoke-JobResult {
+    # Sonuc isleyiciyi cagirir. Isleyici isi ERTELERSE (script gonderildi, sonuc yoklamada) tamamlanan sayilmaz.
+    param($Run, $Job, $Output, [string]$ErrorText, $Label)
+    $script:DeferFlag = $false
+    $script:CurrentRun = $Run
+    try { & $Run.OnResultFn -Key $Job.Key -Output $Output -ErrorText $ErrorText }
+    catch { $Label.Text = "Sonuc isleme hatasi: $($_.Exception.Message)" }
+    if (-not $script:DeferFlag) { $Run.Done++ }
+}
+
+# ---------- TOPLU SCRIPT SONUCU YOKLAMASI (UI thread'i yonetir, sorgular arka plandaki ayri runspace'te) ----------
+# Script her cihaza AYRI gonderilir (worker); gonderilen cihaz $script:ScriptPoll listesine girer ve havuzu birakir.
+# 4 sn'de bir TEK yoklama isi (Get-ScriptPollStatus) bekleyen TUM cihazlarin sonucunu grup basina tek sorguyla alir;
+# gelen sonuc aninda ilgili satira yazilir. Suresi dolan cihaz icin "cevap gelmedi" analizi (DNS/ping/CcmExec) cihaz
+# basina havuzda calisir. Eskiden: cihaz basina 4 sn'de bir 1-2 sorgu + bekleme boyunca dolu havuz slotu.
+
+function Receive-ScriptSend {
+    # Script gonderim isinin sonucu: gonderildiyse yoklamaya alinir (is ERTELENIR), degilse son isleyiciye gider.
+    param($Key, $Output, $ErrorText, [string]$FinalFn)
+    $r = @($Output | Where-Object { $_ -and $_.PSObject.Properties['Pending'] })[0]
+    if (-not $r -or -not $r.Pending) { & $FinalFn -Key $Key -Output $Output -ErrorText $ErrorText; return }
+
+    $script:DeferFlag = $true
+    [void]$script:ScriptPoll.Add([pscustomobject]@{
+        Id = [guid]::NewGuid().ToString(); Run = $script:CurrentRun; Key = $Key; Base = $r; Phase = 'poll'; Job = $null; Seen = $false
+        Provider = $r.SmsProvider; SiteCode = $r.SiteCode; Guid = $r.ScriptGuid; Rid = $r.ResourceId; Op = $r.OperationId; TaskId = $null
+        Start = $r.SentAt; TimeoutSec = $r.TimeoutSec; Deadline = $r.SentAt.AddSeconds($r.TimeoutSec)
+    })
+    # Kontrol sonuclari (DNS / AD / servis) script sonucu beklenmeden tabloya yazilir
+    $wait = "Gonderildi - sonuc bekleniyor (en fazla $($r.TimeoutSec) sn)"
+    if ($FinalFn -eq 'Update-ParserFromScript') { Set-ParserCheckValues -HostName $Key -Values (ConvertTo-ParserCheckValues -Check $r.Check) }
+    else {
+        Set-GridValues -Hostname $Key -Values @{
+            DnsStatus = $r.DnsStatus; IsOnline = $r.OnlineText; AdStatus = $r.AdStatus; LastLogon = $r.LastLogon
+            Running = $r.Running; NotRunning = $r.NotRunning; CcmExec = $r.CcmExec; ActionResult = $wait
+        }
+    }
+}
+function Receive-ScriptSend1 { param($Key, $Output, $ErrorText) Receive-ScriptSend -Key $Key -Output $Output -ErrorText $ErrorText -FinalFn 'Update-GridFromScript' }
+function Receive-ScriptSend2 { param($Key, $Output, $ErrorText) Receive-ScriptSend -Key $Key -Output $Output -ErrorText $ErrorText -FinalFn 'Update-ParserFromScript' }
+
+function Complete-ScriptItem {
+    # Yoklamadan sonuc geldi (-HasStatus) ya da sure doldu ve analiz bitti (-Verdict): sonuc nesnesini tamamlayip
+    # ilgili panelin son isleyicisine (Update-GridFromScript / Update-ParserFromScript) verir.
+    param($Item, $ExitCode, [string]$OutText, [switch]$HasStatus, $Verdict)
+    $b = $Item.Base
+    $b.Pending = $false
+    if ($HasStatus) {
+        $o  = ([string]$OutText).TrimStart([char]0xFEFF).Trim()
+        $ok = ($null -eq $ExitCode) -or ([int]$ExitCode -eq 0)
+        $b.Output   = $o
+        $b.ExitCode = $ExitCode
+        $b.Detail   = "OperationID: $($Item.Op)`r`nExit code: $ExitCode`r`nCikti:`r`n$o"
+        $b.State    = if ($ok) { 'ok' } else { 'warn' }
+        # Grid'e sadece CIKTI yazilir (satirlar ' | ' ile birlestirilir); exit code / OperationID Detay'dadir.
+        $b.Result   = if ($o) { ((($o -split "`r`n|`n|`r") | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' | ') }
+                      elseif ($ok) { 'Script calisti, cikti bos.' } else { "Script calisti, cikti bos (exit code $ExitCode)." }
+    }
+    else {
+        $b.State  = $Verdict.State
+        $b.Result = $Verdict.Text
+        $b.Detail = "OperationID: $($Item.Op)" + $(if ($Item.Seen) { "`r`nSCCM'de durum kaydi goruldu ancak sonuc/cikti gelmedi." } else { '' })
+    }
+    [void]$script:ScriptPoll.Remove($Item)
+    $lbl = if ($Item.Run.Panel -eq 2) { $lblParserStatus } else { $lblStatus }
+    Invoke-JobResult -Run $Item.Run -Job ([pscustomobject]@{ Key = $Item.Key }) -Output @($b) -ErrorText '' -Label $lbl
+}
+
+function Update-ScriptPoll {
+    # RunTimer'dan cagrilir (200 ms). Agir isler (WMI) UI thread'inde DEGIL, arka planda calisir.
+    # 1) Biten yoklama sorgusunun sonuclarini dagit
+    if ($script:PollJob -and $script:PollJob.Async.IsCompleted) {
+        $r = Complete-Job $script:PollJob
+        $script:PollJob = $null
+        $byId = @{}
+        foreach ($x in $script:ScriptPoll) { $byId[$x.Id] = $x }
+        foreach ($s in @($r.Out)) {
+            $it = $byId[[string]$s.Id]
+            if (-not $it -or $it.Phase -ne 'poll') { continue }   # bu arada iptal edilmis / suresi dolmus
+            if ($s.TaskId) { $it.TaskId = $s.TaskId }
+            if ($s.Seen) { $it.Seen = $true }
+            if ($s.Done) { Complete-ScriptItem -Item $it -ExitCode $s.ExitCode -OutText $s.Output -HasStatus }
+        }
+        $script:PollError = $(if ($r.Err) { $r.Err } else { @($r.Out | Where-Object { $_.Error } | Select-Object -First 1 | ForEach-Object { $_.Error }) -join '' })
+    }
+
+    # 2) Suresi dolanlar: "cevap gelmedi" analizi cihaz basina (havuzda). Yoklama surerken beklenir ki son sonuc kacmasin.
+    $now = Get-Date
+    foreach ($it in @($script:ScriptPoll | Where-Object { -not $script:PollJob -and $_.Phase -eq 'poll' -and $now -ge $_.Deadline })) {
+        $it.Phase = 'verdict'
+        $ps = [powershell]::Create()
+        $ps.RunspacePool = (Get-SharedPool)
+        [void]$ps.AddScript($script:VerdictWorker).AddParameters(@{ ComputerName = $it.Key; TimeoutSec = $it.TimeoutSec })
+        $it.Job = [pscustomobject]@{ PS = $ps; Async = $ps.BeginInvoke(); Key = $it.Key; Done = $false }
+    }
+    foreach ($it in @($script:ScriptPoll | Where-Object { $_.Phase -eq 'verdict' -and $_.Job.Async.IsCompleted })) {
+        $r = Complete-Job $it.Job
+        $v = @($r.Out | Where-Object { $_ -and $_.PSObject.Properties['Text'] })[0]
+        if (-not $v) { $v = [pscustomobject]@{ State = 'warn'; Text = "$($it.TimeoutSec) sn icinde yanit gelmedi; sebep analizi yapilamadi ($($r.Err))." } }
+        Complete-ScriptItem -Item $it -Verdict $v
+    }
+
+    # 3) Yeni yoklama: ayni anda tek sorgu, en fazla 4 sn'de bir
+    $wait = @($script:ScriptPoll | Where-Object { $_.Phase -eq 'poll' -and ($now - $_.Start).TotalSeconds -ge 3 })
+    if (-not $script:PollJob -and $wait.Count -gt 0 -and ($now - $script:LastPoll).TotalSeconds -ge 4) {
+        if (-not $script:PollRunspace -or $script:PollRunspace.RunspaceStateInfo.State -ne 'Opened') {
+            $script:PollRunspace = [runspacefactory]::CreateRunspace()
+            $script:PollRunspace.Open()
+        }
+        $items = @($wait | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Provider = $_.Provider; SiteCode = $_.SiteCode; Guid = $_.Guid; Rid = $_.Rid; Op = $_.Op; TaskId = $_.TaskId; Start = $_.Start } })
+        $ps = [powershell]::Create()
+        $ps.Runspace = $script:PollRunspace
+        [void]$ps.AddScript($script:PollWorker).AddParameter('Items', $items)
+        $script:PollJob = [pscustomobject]@{ PS = $ps; Async = $ps.BeginInvoke(); Key = 'poll'; Done = $false }
+        $script:LastPoll = $now
+        $script:PollCount++
+    }
+}
+
+function Get-RunWaitCount {
+    param($Run)
+    return @($script:ScriptPoll | Where-Object { [object]::ReferenceEquals($_.Run, $Run) }).Count
+}
+
+function Stop-PanelRun {
+    # IPTAL: paneldeki bekleyen / calisan isler durdurulur. Tamamlanmis sonuclar korunur; durdurulanlarin satirina
+    # "Iptal edildi" yazilir. Uzak bir cagri (WMI/RPC) o an suruyorsa arka planda bitmesi beklenir, sonucu yok sayilir.
+    # NOT: SCCM'e gonderilmis bir script / istemci eylemi geri ALINAMAZ; sadece sonucunu beklemek birakilir.
+    param([int]$Panel)
+
+    $runs = @($script:ActiveRuns | Where-Object { $_.Panel -eq $Panel })
+    $pfs  = @($script:Prefetch | Where-Object { $_.Panel -eq $Panel })
+    if ($runs.Count -eq 0 -and $pfs.Count -eq 0) { return }
+    $left = 0
+    foreach ($pf in $pfs) { $left += @($pf.Items).Count }
+    foreach ($st in $runs) { $left += @($st.Jobs | Where-Object { -not $_.Done }).Count + (Get-RunWaitCount $st) }
+    $c = [System.Windows.Forms.MessageBox]::Show(
+        "Panel ${Panel}: $(($runs | ForEach-Object { $_.Title }) -join ', ')`n`n$left is henuz tamamlanmadi. Iptal edilsin mi?`n`nTamamlanan sonuclar tabloda kalir. SCCM'e gonderilmis script / eylemler geri alinamaz (sadece sonucu beklenmez).",
+        'Iptal', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($c -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+    $lbl = if ($Panel -eq 2) { $lblParserStatus } else { $lblStatus }
+    $n = 0
+    foreach ($pf in $pfs) {   # SCCM on-almasi surerken iptal: is hic baslamadi
+        [void]$script:Prefetch.Remove($pf)
+        try { [void]$pf.Job.PS.BeginStop($null, $null) } catch { }
+        [void]$script:CancelledJobs.Add($pf.Job)
+        $fake = [pscustomobject]@{ Panel = $Panel; Done = 0; OnResultFn = $pf.RunArgs.OnResultFn }
+        foreach ($it in $pf.Items) { Invoke-JobResult -Run $fake -Job $it -Output @() -ErrorText $script:CancelText -Label $lbl; $n++ }
+    }
+    foreach ($st in $runs) {
+        foreach ($job in $st.Jobs) {
+            if ($job.Done) { continue }
+            $job.Done = $true
+            if ($job.Async.IsCompleted) {   # o an bitmis: gercek sonucu isle
+                $r = Complete-Job $job
+                Invoke-JobResult -Run $st -Job $job -Output $r.Out -ErrorText $r.Err -Label $lbl
+                continue
+            }
+            try { [void]$job.PS.BeginStop($null, $null) } catch { }
+            [void]$script:CancelledJobs.Add($job)
+            Invoke-JobResult -Run $st -Job $job -Output @() -ErrorText $script:CancelText -Label $lbl
+            $n++
+        }
+        # Sonucu yoklamada bekleyen scriptler (gonderilmis; sadece beklemeyi birakiriz)
+        foreach ($it in @($script:ScriptPoll | Where-Object { [object]::ReferenceEquals($_.Run, $st) })) {
+            if ($it.Job -and -not $it.Job.Async.IsCompleted) { try { [void]$it.Job.PS.BeginStop($null, $null) } catch { }; [void]$script:CancelledJobs.Add($it.Job) }
+            elseif ($it.Job) { $null = Complete-Job $it.Job }
+            [void]$script:ScriptPoll.Remove($it)
+            Invoke-JobResult -Run $st -Job ([pscustomobject]@{ Key = $it.Key }) -Output @() -ErrorText $script:CancelText -Label $lbl
+            $n++
+        }
+        [void]$script:ActiveRuns.Remove($st)
+        if ($st.Report -and $st.Report.Count -gt 0) { [void]$script:ReportQueue.Add($st) }
+        Write-ActionLog -Hostname '-' -Action "$($st.Title) - IPTAL" -State 'warn' -Text "$($st.Total) isten $($st.Total - $n) tamamlandi, $n iptal edildi"
+    }
+    $lbl.ForeColor = [System.Drawing.Color]::DarkOrange
+    $lbl.Text = "Iptal edildi: $n is durduruldu, tamamlanan sonuclar tabloda."
+    Set-UiBusy -Panel $Panel -Busy $false
+    if ($Panel -eq 2) { Update-ParserInfo }
+    Show-PendingReports
+}
+
 $script:RunTimer.Add_Tick({
+    # Iptal edilmis isler: uzak cagri bitince kaynak birakilir, sonuc yok sayilir
+    foreach ($z in @($script:CancelledJobs)) {
+        if ($z.Async.IsCompleted) { $null = Complete-Job $z; [void]$script:CancelledJobs.Remove($z) }
+    }
+    if ($script:Prefetch.Count -gt 0) { Update-Prefetch }
+    if ($script:ScriptPoll.Count -gt 0 -or $script:PollJob) { Update-ScriptPoll }
+
     foreach ($st in @($script:ActiveRuns)) {
         $lbl = if ($st.Panel -eq 2) { $lblParserStatus } else { $lblStatus }
         $pending = $false
-
         foreach ($job in $st.Jobs) {
             if ($job.Done) { continue }
-
-            if ($job.Async.IsCompleted) {
-                $job.Done = $true
-                $out = @()
-                $errText = ''
-                try { $out = @($job.PS.EndInvoke($job.Async)) } catch { $errText = $_.Exception.Message }
-                if ($out.Count -eq 0 -and -not $errText -and $job.PS.Streams.Error.Count -gt 0) {
-                    $errText = $job.PS.Streams.Error[0].ToString()
-                }
-                $job.PS.Dispose()
-
-                try {
-                    $fn = $st.OnResultFn
-                    & $fn -Key $job.Key -Output $out -ErrorText $errText
-                }
-                catch {
-                    $lbl.Text = "Sonuc isleme hatasi: $($_.Exception.Message)"
-                }
-
-                $st.Done++
-                $lbl.Text = "$($st.Title): $($st.Done) / $($st.Total) tamamlandi (ayni anda en fazla $($script:MaxParallel) istek)"
-            }
-            else {
-                $pending = $true
-            }
+            if (-not $job.Async.IsCompleted) { $pending = $true; continue }
+            $job.Done = $true
+            $r = Complete-Job $job
+            Invoke-JobResult -Run $st -Job $job -Output $r.Out -ErrorText $r.Err -Label $lbl
         }
-
-        if (-not $pending) {
+        $w = Get-RunWaitCount $st
+        $txt = "$($st.Title): $($st.Done) / $($st.Total) tamamlandi (ayni anda en fazla $($script:MaxParallel) istek)"
+        if ($w -gt 0) {
+            $txt += "  |  $w cihazin script sonucu bekleniyor (toplu yoklama: 4 sn'de bir tek sorgu, $($script:PollCount). tur)"
+            if ($script:PollError) { $txt += "  |  Son yoklama hatasi: $($script:PollError)" }
+        }
+        if ($lbl.Text -ne $txt) { $lbl.Text = $txt }
+        if (-not $pending -and $w -eq 0) {
             [void]$script:ActiveRuns.Remove($st)
-            $lbl.Text = "$($st.Title) tamamlandi. $($st.Total) makine islendi."
+            if ($st.Report -and $st.Report.Count -gt 0) { [void]$script:ReportQueue.Add($st) }
+            $lbl.Text = "$($st.Title) tamamlandi. $($st.Total) $($st.Unit) islendi."
             Set-UiBusy -Panel $st.Panel -Busy $false
             if ($st.Panel -eq 2) { Update-ParserInfo }
         }
     }
-
-    if ($script:ActiveRuns.Count -eq 0) { $script:RunTimer.Stop() }
+    if ($script:ActiveRuns.Count -eq 0 -and $script:CancelledJobs.Count -eq 0 -and $script:ScriptPoll.Count -eq 0 -and -not $script:PollJob -and $script:Prefetch.Count -eq 0) { $script:RunTimer.Stop() }
+    Show-PendingReports   # en sonda: modal pencere acikken gelen tick'ler isleri islemeye devam eder
 })
 
 # ---------- Sonuc isleyiciler (UI thread'inde calisir) ----------
@@ -1134,16 +1360,16 @@ function Update-GridFromCheck {
     param($Key, $Output, $ErrorText)
     $r = @($Output)[0]
     if (-not $r -or -not $r.PSObject.Properties['DnsStatus']) {
-        Resolve-PendingCells -Hostname $Key
-        Set-GridValues -Hostname $Key -Values @{ ErrorMessage = "Islem hatasi: $ErrorText"; State = 'fail' }
+        Resolve-PendingCells -Hostname $Key -ErrorText $ErrorText
+        Set-GridValues -Hostname $Key -Values @{ ErrorMessage = (Format-JobError $ErrorText); State = 'fail' }
         return
     }
-    $script:LastResults = @($script:LastResults) + $r
+    $script:LastResults[$r.Hostname] = $r
     # State 'fail' = DNS cozumlenemedi / ping yok -> servis bilgisi alinamadi (ulasilamadi)
     $un = ($r.State -eq 'fail')
     Set-GridValues -Hostname $r.Hostname -Values @{
         DnsStatus    = $r.DnsStatus
-        IsOnline     = $(if ($r.IsOnline) { 'Evet' } else { 'Hayir' })
+        IsOnline     = $r.OnlineText
         AdStatus     = $r.AdStatus
         LastLogon    = $r.LastLogon
         Running      = $(if ($un) { 'Ulasilamadi' } else { $r.Running })
@@ -1152,34 +1378,42 @@ function Update-GridFromCheck {
         ErrorMessage = $r.ErrorMessage
         State        = $r.State
     }
-    Add-RowDetail -Hostname $r.Hostname -Text ("Kontrol: DNS=$($r.DnsStatus); Online=$($r.IsOnline); AD=$($r.AdStatus); LastLogon=$($r.LastLogon); CcmExec=$($r.CcmExec)" + $(if ($r.ErrorMessage) { "`r`nNot: $($r.ErrorMessage)" } else { '' }))
+    Add-RowDetail -Hostname $r.Hostname -Text ("Kontrol: DNS=$($r.DnsStatus); Online=$($r.OnlineText); AD=$($r.AdStatus); LastLogon=$($r.LastLogon); CcmExec=$($r.CcmExec)" + $(if ($r.ErrorMessage) { "`r`nNot: $($r.ErrorMessage)" } else { '' }))
+}
+
+function ConvertFrom-FixRows {
+    # Servis baslatma sonuc satirlarini (Start-RemoteFix) tablo degerlerine cevirir. $null = gecerli sonuc yok.
+    param($Output)
+    $rows = @($Output | Where-Object { $_ -and $_.PSObject.Properties['ServiceName'] })
+    if ($rows.Count -eq 0) { return $null }
+    $notRun = (($rows | Where-Object { $_.SonrakiDurum -ne 'Running' } | ForEach-Object { "$($_.ServiceName)($($_.SonrakiDurum))" }) -join ', ')
+    return [pscustomobject]@{
+        Running       = (($rows | Where-Object { $_.SonrakiDurum -eq 'Running' } | ForEach-Object { $_.ServiceName }) -join ', ')
+        NotRunning    = $notRun
+        State         = $(if ($notRun) { 'warn' } else { 'ok' })
+        Summary       = (Get-HostSummary -HostResults $rows)
+        Detail        = ("Servis baslatma:`r`n" + (($rows | ForEach-Object { "  $($_.ServiceName): $($_.OncekiDurum) -> $($_.SonrakiDurum) ($($_.Aciklama))" }) -join "`r`n"))
+        ServiceDetail = @($rows | ForEach-Object { [pscustomobject]@{ Name = $_.ServiceName; Status = $_.SonrakiDurum } })
+    }
 }
 
 function Update-GridFromFix {
     param($Key, $Output, $ErrorText)
-    $rows = @($Output | Where-Object { $_.PSObject.Properties['ServiceName'] })
-    if ($rows.Count -eq 0) {
-        Set-GridValues -Hostname $Key -Values @{ LastAction = 'Servis baslat'; ActionResult = "Islem hatasi: $ErrorText"; State = 'fail' }
+    $f = ConvertFrom-FixRows $Output
+    if (-not $f) {
+        Set-GridValues -Hostname $Key -Values @{ LastAction = 'Servis baslat'; ActionResult = (Format-JobError $ErrorText); State = 'fail' }
+        Add-FixReport -Hostname $Key -Status (Format-JobError $ErrorText)
         return
     }
-    $summary = Get-HostSummary -HostResults $rows
-    $newRunning    = (($rows | Where-Object { $_.SonrakiDurum -eq 'Running' } | ForEach-Object { $_.ServiceName }) -join ', ')
-    $newNotRunning = (($rows | Where-Object { $_.SonrakiDurum -ne 'Running' } | ForEach-Object { "$($_.ServiceName)($($_.SonrakiDurum))" }) -join ', ')
-
-    # Sonraki "Servisleri Baslat" tiklamasi guncel duruma gore calissin
-    foreach ($e in @($script:LastResults | Where-Object { $_.Hostname -eq $Key })) {
-        $e.ServiceDetail = @($rows | ForEach-Object { [pscustomobject]@{ Name = $_.ServiceName; Status = $_.SonrakiDurum } })
-    }
-
+    Add-FixReport -Hostname $Key -Status $f.Summary -Fix $f
+    $e = $script:LastResults[$Key]   # sonraki "Servisleri Baslat" guncel duruma gore calissin
+    if ($e) { $e.ServiceDetail = $f.ServiceDetail }
     Set-GridValues -Hostname $Key -Values @{
-        Running      = $newRunning
-        NotRunning   = $newNotRunning
-        LastAction   = "Servis baslat ($(Get-Date -Format 'HH:mm:ss'))"
-        ActionResult = $summary
-        State        = $(if ($newNotRunning) { 'warn' } else { 'ok' })
+        Running = $f.Running; NotRunning = $f.NotRunning; State = $f.State
+        LastAction = "Servis baslat ($(Get-Date -Format 'HH:mm:ss'))"; ActionResult = $f.Summary
     }
-    Add-RowDetail -Hostname $Key -Text ("Servis baslatma:`r`n" + (($rows | ForEach-Object { "  $($_.ServiceName): $($_.OncekiDurum) -> $($_.SonrakiDurum) ($($_.Aciklama))" }) -join "`r`n"))
-    Write-ActionLog -Hostname $Key -Action 'Servis baslat' -State $(if ($newNotRunning) { 'warn' } else { 'ok' }) -Text $summary
+    Add-RowDetail -Hostname $Key -Text $f.Detail
+    Write-ActionLog -Hostname $Key -Action 'Servis baslat' -State $f.State -Text $f.Summary
 }
 
 function Update-GridFromAction {
@@ -1187,7 +1421,7 @@ function Update-GridFromAction {
     param($Key, $Output, $ErrorText)
     $r = @($Output)[0]
     if (-not $r -or -not $r.PSObject.Properties['Action']) {
-        $r = [pscustomobject]@{ Hostname = $Key; Action = 'Islem'; State = 'fail'; Result = "Islem hatasi: $ErrorText"; Detail = '' }
+        $r = [pscustomobject]@{ Hostname = $Key; Action = 'Islem'; State = 'fail'; Result = (Format-JobError $ErrorText); Detail = '' }
     }
     $one = ("$($r.Result)" -replace '\s+', ' ').Trim()
     Set-GridValues -Hostname $r.Hostname -Values @{
@@ -1208,8 +1442,8 @@ function Update-GridFromScript {
 
     $r = @($Output | Where-Object { $_ -and $_.PSObject.Properties['Output'] })[0]
     if (-not $r) {
-        $msg = "Islem hatasi: $ErrorText"
-        Resolve-PendingCells -Hostname $Key
+        $msg = (Format-JobError $ErrorText)
+        Resolve-PendingCells -Hostname $Key -ErrorText $ErrorText
         Set-GridValues -Hostname $Key -Values @{ LastAction = "Script ($(Get-Date -Format 'HH:mm:ss'))"; ActionResult = $msg; State = 'fail' }
         Add-RowDetail -Hostname $Key -Text "Script: $msg"
         Write-ActionLog -Hostname $Key -Action 'Script' -State 'fail' -Text $msg
@@ -1230,7 +1464,7 @@ function Update-GridFromScript {
 
     Set-GridValues -Hostname $r.Hostname -Values @{
         DnsStatus    = $r.DnsStatus
-        IsOnline     = $(if ($r.IsOnline) { 'Evet' } else { 'Hayir' })
+        IsOnline     = $r.OnlineText
         AdStatus     = $r.AdStatus
         LastLogon    = $r.LastLogon
         Running      = $(if ($un -and -not $r.Running) { 'Ulasilamadi' } else { $r.Running })
@@ -1243,10 +1477,9 @@ function Update-GridFromScript {
     }
 
     # "Servisleri Baslat" butonu bu makineyi de kapsasin
-    $script:LastResults = @(@($script:LastResults | Where-Object { $_.Hostname -ne $r.Hostname }) + [pscustomobject]@{
-        Hostname = $r.Hostname; IsOnline = [bool]$r.IsOnline; ServiceDetail = @($r.ServiceDetail) })
+    $script:LastResults[$r.Hostname] = [pscustomobject]@{ Hostname = $r.Hostname; IsOnline = [bool]$r.IsOnline; ServiceDetail = @($r.ServiceDetail) }
 
-    $d = "$($r.Action): $($r.Result)`r`nAD: $($r.AdStatus); LastLogon: $($r.LastLogon); DNS: $($r.DnsStatus); Online: $($r.IsOnline); CcmExec: $($r.CcmExec)"
+    $d = "$($r.Action): $($r.Result)`r`nAD: $($r.AdStatus); LastLogon: $($r.LastLogon); DNS: $($r.DnsStatus); Online: $($r.OnlineText); CcmExec: $($r.CcmExec)"
     if (@($r.ServiceDetail).Count -gt 0) {
         $d += "`r`nServisler: " + ((@($r.ServiceDetail) | ForEach-Object { "$($_.Name)=$($_.Status)" }) -join ', ')
     }
@@ -1261,8 +1494,8 @@ function Update-GridFromAd {
 
     $r = @($Output | Where-Object { $_ -and $_.PSObject.Properties['AdStatus'] -and $_.PSObject.Properties['DnsStatus'] })[0]
     if (-not $r) {
-        $msg = "Islem hatasi: $ErrorText"
-        Resolve-PendingCells -Hostname $Key
+        $msg = (Format-JobError $ErrorText)
+        Resolve-PendingCells -Hostname $Key -ErrorText $ErrorText
         Set-GridValues -Hostname $Key -Values @{ LastAction = "AD yapisi kontrolu ($(Get-Date -Format 'HH:mm:ss'))"; ActionResult = $msg; State = 'fail' }
         Add-RowDetail -Hostname $Key -Text "AD yapisi kontrolu: $msg"
         return
@@ -1271,7 +1504,7 @@ function Update-GridFromAd {
     $summary = "AD: $($r.AdStatus); Last Logon: $($r.LastLogon)"
     Set-GridValues -Hostname $r.Hostname -Values @{
         DnsStatus    = $r.DnsStatus
-        IsOnline     = $(if ($r.IsOnline) { 'Evet' } else { 'Hayir' })
+        IsOnline     = $r.OnlineText
         AdStatus     = $r.AdStatus
         LastLogon    = $r.LastLogon
         LastAction   = "AD yapisi kontrolu ($(Get-Date -Format 'HH:mm:ss'))"
@@ -1279,8 +1512,224 @@ function Update-GridFromAd {
         ErrorMessage = $r.ErrorMessage
         State        = $r.State
     }
-    Add-RowDetail -Hostname $r.Hostname -Text ("AD yapisi kontrolu: DNS=$($r.DnsStatus); Online=$($r.IsOnline); AD=$($r.AdStatus); LastLogon=$($r.LastLogon)" + $(if ($r.ErrorMessage) { "`r`nNot: $($r.ErrorMessage)" } else { '' }))
+    Add-RowDetail -Hostname $r.Hostname -Text ("AD yapisi kontrolu: DNS=$($r.DnsStatus); Online=$($r.OnlineText); AD=$($r.AdStatus); LastLogon=$($r.LastLogon)" + $(if ($r.ErrorMessage) { "`r`nNot: $($r.ErrorMessage)" } else { '' }))
     Write-ActionLog -Hostname $r.Hostname -Action 'AD yapisi kontrolu' -State $r.State -Text $summary
+}
+
+# ---------- AD onbellegi (CSV) guncelleme (UI thread'i) ----------
+
+function Update-AdCacheLabel {
+    # Onbellek durumunu (kayit sayisi + son guncelleme zamani) kontrol grubundaki etikete yazar.
+    $idx = Get-AdCacheIndex
+    if ($idx.Ok) {
+        $age  = ((Get-Date) - $idx.Time).TotalDays
+        $text = "Onbellek: $($idx.Count) kayit | $($idx.Time.ToString('yyyy-MM-dd HH:mm'))"
+        if ($age -gt 7) { $text += ' (eski)' }
+        $lblAdCache.Text      = $text
+        $lblAdCache.ForeColor = $(if ($age -gt 7) { [System.Drawing.Color]::DarkOrange } else { [System.Drawing.Color]::DimGray })
+    }
+    elseif (@($script:AdCacheSources).Count -eq 0) {
+        $lblAdCache.Text      = "Domain / OU tanimli degil - 'AD Onbellegi...' ile ekleyin"
+        $lblAdCache.ForeColor = [System.Drawing.Color]::Firebrick
+    }
+    else {
+        $lblAdCache.Text      = 'Onbellek yok - AD bilgisi okunamaz'
+        $lblAdCache.ForeColor = [System.Drawing.Color]::Firebrick
+    }
+}
+
+function Get-AdSourcesFromGrid {
+    # Dialogdaki tabloyu dogrular ve { Sources; Errors } dondurur.
+    param($Grid)
+
+    $list = @()
+    $errs = @()
+    $seen = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+    $null = $Grid.EndEdit()
+    foreach ($row in $Grid.Rows) {
+        if ($row.IsNewRow) { continue }
+        $d = ([string]$row.Cells[0].Value).Trim()
+        $o = ([string]$row.Cells[1].Value).Trim()
+        if (-not $d -and -not $o) { continue }
+        $n = $row.Index + 1
+        if ($d -notmatch '^[A-Za-z0-9][A-Za-z0-9.-]*$') { $errs += "Satir ${n}: gecerli bir domain adi girin (ornek: domain1.local)."; continue }
+        if ($o -notmatch '(?i)DC=')                     { $errs += "Satir ${n}: OU, DistinguishedName olmali (ornek: OU=Workstations,DC=domain1,DC=local)."; continue }
+        $k = "$d|$o"
+        if ($seen.ContainsKey($k)) { $errs += "Satir ${n}: ayni domain / OU birden fazla kez girilmis."; continue }
+        $seen[$k] = $true
+        $list += [pscustomobject]@{ Domain = $d; OU = $o }
+    }
+    return [pscustomobject]@{ Sources = $list; Errors = $errs }
+}
+
+function Invoke-AdDialogApply {
+    # Dialogdaki tabloyu dogrular; gecerliyse listeyi ana ayar dosyasina (JSON) kaydeder.
+    $res = Get-AdSourcesFromGrid -Grid $script:AdDlgGrid
+    if (@($res.Errors).Count -gt 0) {
+        [System.Windows.Forms.MessageBox]::Show(($res.Errors -join "`n"), 'Uyari', 'OK', 'Warning') | Out-Null
+        return $false
+    }
+    $script:AdCacheSources = @($res.Sources)
+    Save-Settings
+    Update-AdCacheLabel
+    return $true
+}
+
+function Show-AdCacheDialog {
+    # Domain -> OU eslemesinin girildigi pencere. Liste ana ayar dosyasina (JSON) yazilir;
+    # "Kaydet ve Onbellegi Guncelle" ayrica AD'den okuyup CSV onbellegini yeniden olusturur.
+    $dlg = New-Ctl Form 'AD Onbellegi - Domain / OU Eslemesi' 0 0 860 450 @{ StartPosition = 'CenterParent'; MinimumSize = (New-Object System.Drawing.Size(700, 360)); ShowInTaskbar = $false }
+    $lbl = New-Ctl Label ("Her satira bir domain ve o domain'de taranacak OU'yu yazin (OU, DistinguishedName olarak; ornek: OU=Workstations,DC=domain1,DC=local). " +
+            "OU'nun ALTINDAKI (alt OU'lar dahil) tum bilgisayar hesaplari onbellege alinir. Ayni domain icin birden fazla satir girilebilir. " +
+            "Satir silmek icin satir basligini secip Delete'e basin.") 12 10 820 48 @{ Anchor = 'Top,Left,Right' }
+
+    $grid = New-Ctl DataGridView '' 12 64 820 260 @{
+        Anchor = 'Top,Bottom,Left,Right'; AllowUserToAddRows = $true; AllowUserToDeleteRows = $true; AllowUserToResizeRows = $false
+        RowHeadersVisible = $true; SelectionMode = 'RowHeaderSelect'; BackgroundColor = [System.Drawing.Color]::White; AutoSizeColumnsMode = 'Fill'
+    }
+    foreach ($c in @(@('Domain (DNS adi)', 30), @('OU (DistinguishedName)', 70))) {
+        $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $col.HeaderText = $c[0]; $col.FillWeight = $c[1]
+        [void]$grid.Columns.Add($col)
+    }
+    foreach ($s in @($script:AdCacheSources)) { [void]$grid.Rows.Add([string]$s.Domain, [string]$s.OU) }
+
+    $idx = Get-AdCacheIndex
+    $info = if ($idx.Ok) { "Mevcut onbellek: $($idx.Count) kayit, son guncelleme $($idx.Time.ToString('yyyy-MM-dd HH:mm'))`n$(Get-AdCacheFile)" } else { "Mevcut onbellek yok.`n$(Get-AdCacheFile)" }
+    $lblInfo    = New-Ctl Label $info 12 332 820 34 @{ Anchor = 'Bottom,Left,Right'; ForeColor = [System.Drawing.Color]::DimGray }
+    $btnSave    = New-Ctl Button 'Kaydet' 12 374 110 30 @{ Anchor = 'Bottom,Left' }
+    $btnSaveUpd = New-Ctl Button 'Kaydet ve Onbellegi Guncelle' 130 374 210 30 @{ Anchor = 'Bottom,Left' }
+    $btnClose   = New-Ctl Button 'Kapat' 732 374 100 30 @{ Anchor = 'Bottom,Right'; DialogResult = [System.Windows.Forms.DialogResult]::Cancel }
+
+    # Olay isleyicileri closure DEGIL (GetNewClosure icinde $script: ana script yerine dinamik modulu gosterir)
+    $script:AdDlg     = $dlg
+    $script:AdDlgGrid = $grid
+    $btnSave.Add_Click({
+        if (Invoke-AdDialogApply) { $script:AdDlg.Tag = 'save'; $script:AdDlg.DialogResult = [System.Windows.Forms.DialogResult]::OK }
+    })
+    $btnSaveUpd.Add_Click({
+        if (@($script:AdDlgGrid.Rows | Where-Object { -not $_.IsNewRow }).Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('Once en az bir domain / OU satiri girin.', 'Uyari') | Out-Null
+            return
+        }
+        if (Invoke-AdDialogApply) { $script:AdDlg.Tag = 'update'; $script:AdDlg.DialogResult = [System.Windows.Forms.DialogResult]::OK }
+    })
+
+    $dlg.CancelButton = $btnClose
+    $dlg.Controls.AddRange(@($lbl, $grid, $lblInfo, $btnSave, $btnSaveUpd, $btnClose))
+    [void]$dlg.ShowDialog($form)
+    $doUpdate = ($dlg.Tag -eq 'update')
+    $dlg.Dispose()
+    if ($doUpdate) { Start-AdCacheUpdate }   # pencere kapandiktan sonra (arka planda, UI donmaz)
+}
+
+function Start-AdCacheUpdate {
+    # Kullanici isterse: kayitli domain / OU eslemesindeki her OU AD'den taranir ve CSV onbellegi yeniden yazilir.
+    # Domain basina TEK is baslatilir; o domain'in OU'lari is icinde sirayla taranir.
+    $src = @($script:AdCacheSources)
+    if ($src.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Once 'AD Onbellegi...' penceresinden en az bir domain / OU girin.", 'Uyari') | Out-Null
+        return
+    }
+
+    $script:AdCacheNew = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+    $items = @(foreach ($g in ($src | Group-Object -Property Domain)) {
+        $ous = [string[]]@($g.Group | ForEach-Object { [string]$_.OU })
+        [pscustomobject]@{ Key = [string]$g.Name; Params = @{ Domain = [string]$g.Name; SearchBases = $ous } }
+    })
+    Start-ParallelRun -Title 'AD onbellek guncelleme' -Worker $script:AdCacheWorker -Items $items -OnResultFn 'Update-AdCacheFromWorker' -Unit 'domain'
+}
+
+function Update-AdCacheFromWorker {
+    # Her domain'in sonucu geldikce toplanir; hepsi gelince CSV yazilir.
+    param($Key, $Output, $ErrorText)
+
+    $r = @($Output | Where-Object { $_ -and $_.PSObject.Properties['Items'] -and $_.PSObject.Properties['Domain'] })[0]
+    if (-not $r) {
+        # Is hic sonuc donmedi: bu domain'in tum OU'lari basarisiz sayilir
+        $fail = foreach ($s in @($script:AdCacheSources | Where-Object { $_.Domain -eq $Key })) {
+            [pscustomobject]@{ SearchBase = [string]$s.OU; Ok = $false; Error = (Format-JobError $ErrorText); Rows = @() }
+        }
+        $r = [pscustomobject]@{ Domain = [string]$Key; Items = @($fail) }
+    }
+    $script:AdCacheNew[[string]$Key] = $r
+
+    $domains = @($script:AdCacheSources | Group-Object -Property Domain).Count   # buyuk/kucuk harf duyarsiz
+    if ($script:AdCacheNew.Count -ge $domains) { Save-AdCache }
+}
+
+function Save-AdCache {
+    # Basarili OU'larin yeni verisini yazar; basarisiz OU'nun ESKI verisini korur (yarim guncelleme veri kaybettirmez).
+    # CSV once gecici dosyaya yazilir, sonra yerine tasinir (calisan sorgular yarim dosya okumasin).
+    $file = Get-AdCacheFile
+    $old  = @()
+    if (Test-Path -LiteralPath $file) {
+        try { $old = @(Import-Csv -LiteralPath $file -Delimiter ';' -Encoding UTF8 -ErrorAction Stop) } catch { $old = @() }
+    }
+
+    $all      = New-Object System.Collections.ArrayList
+    $okCount  = 0
+    $problems = @()
+    $summary  = @()
+    foreach ($s in @($script:AdCacheSources)) {
+        $dom = [string]$s.Domain
+        $ou  = [string]$s.OU
+        $dr  = $script:AdCacheNew[$dom]
+        $r   = $null
+        if ($dr) { $r = @($dr.Items | Where-Object { $_.SearchBase -eq $ou })[0] }
+        if ($r -and $r.Ok) {
+            $okCount++
+            $n = 0
+            foreach ($row in @($r.Rows)) { [void]$all.Add($row); $n++ }
+            $summary += "${dom} [$ou]: $n makine"
+        }
+        else {
+            $keep = @($old | Where-Object { $_.Domain -eq $dom -and ([string]$_.DistinguishedName).EndsWith($ou, [System.StringComparison]::OrdinalIgnoreCase) })
+            foreach ($row in $keep) { [void]$all.Add($row) }
+            $why = if ($r -and $r.Error) { $r.Error } else { 'sonuc alinamadi' }
+            $problems += "${dom} [$ou]: $why`n   (eski veri korundu: $($keep.Count) kayit)"
+        }
+    }
+
+    if ($okCount -eq 0) {
+        Write-ActionLog -Hostname '-' -Action 'AD onbellek guncelleme' -State 'fail' -Text ($problems -join ' | ')
+        [System.Windows.Forms.MessageBox]::Show("Hicbir OU'dan veri alinamadi; mevcut onbellek DEGISTIRILMEDI.`n`n" + ($problems -join "`n`n"), 'AD Onbellegi', 'OK', 'Error') | Out-Null
+        return
+    }
+
+    # Ic ice OU'lar ayni hesabi iki kez getirebilir: DistinguishedName'e gore tekillestir
+    $uniq = New-Object System.Collections.ArrayList
+    $seen = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($row in $all) {
+        $k = [string]$row.DistinguishedName
+        if (-not $k) { $k = "$($row.Domain)|$($row.Hostname)" }
+        if ($seen.ContainsKey($k)) { continue }
+        $seen[$k] = $true
+        [void]$uniq.Add($row)
+    }
+
+    $tmp = "$file.tmp"
+    try {
+        if ($uniq.Count -gt 0) {
+            $uniq | Select-Object Hostname, Domain, Enabled, LastLogonTimestamp, DistinguishedName, CacheTime |
+                Export-Csv -LiteralPath $tmp -Delimiter ';' -NoTypeInformation -Encoding UTF8
+        }
+        else {
+            Set-Content -LiteralPath $tmp -Value '"Hostname";"Domain";"Enabled";"LastLogonTimestamp";"DistinguishedName";"CacheTime"' -Encoding UTF8
+        }
+        Move-Item -LiteralPath $tmp -Destination $file -Force
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show("Onbellek dosyasi yazilamadi:`n`n$($_.Exception.Message)", 'AD Onbellegi', 'OK', 'Error') | Out-Null
+        return
+    }
+
+    Update-AdCacheLabel
+    $state = if ($problems.Count -gt 0) { 'warn' } else { 'ok' }
+    Write-ActionLog -Hostname '-' -Action 'AD onbellek guncelleme' -State $state -Text (($summary + $problems) -join ' | ')
+    if ($problems.Count -gt 0) {
+        [System.Windows.Forms.MessageBox]::Show("Onbellek guncellendi ancak bazi OU'lar alinamadi:`n`n" + ($problems -join "`n`n"), 'AD Onbellegi', 'OK', 'Warning') | Out-Null
+    }
 }
 
 # ---------- SCCM yardimcilari (UI thread'i) ----------
@@ -1385,8 +1834,13 @@ function Show-TextDialog {
     [void]$dlg.ShowDialog()
 }
 
+function Get-ExportStamp {
+    # Excel / CSV dosya adlari icin zaman damgasi: gun-ay-saat-dakika (ornek: 23-10-14-35)
+    return (Get-Date -Format 'dd-MM-HH-mm')
+}
+
 function Export-ToExcelAndOpen {
-    param([object[]]$Data, [string]$DefaultFileName = "Rapor_$(Get-Date -Format 'yyyyMMdd_HHmmss')")
+    param([object[]]$Data, [string]$DefaultFileName = (Get-ExportStamp))
 
     if (-not $Data -or @($Data).Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show('Aktarilacak veri yok.', 'Bilgi') | Out-Null
@@ -1439,6 +1893,11 @@ function Export-ToExcelAndOpen {
         [System.Windows.Forms.MessageBox]::Show("Excel'e aktarma sirasinda hata olustu: $($_.Exception.Message)", 'Hata') | Out-Null
         try { $excel.Quit() } catch { }
     }
+    finally {
+        # COM referanslari birakilir (aksi halde kapatildiktan sonra arka planda EXCEL.EXE asili kalir)
+        foreach ($o in @($headerRange, $ws, $wb, $excel)) { if ($o) { try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($o) } catch { } } }
+        [GC]::Collect()
+    }
 }
 
 function Export-GridToCsv {
@@ -1476,6 +1935,14 @@ function Export-GridToCsv {
     }
 }
 
+function Protect-CellText {
+    # Excel/CSV formul enjeksiyonu onlemi: uzak makinelerden gelen script ciktisi '=', '+', '@', '-' ile basliyorsa Excel
+    # onu FORMUL olarak calistirabilir (DDE vb.). Basina ' eklenir (Excel'de gorunmez, metin olarak saklanir). Sayilar dokunulmaz.
+    param([string]$Text)
+    if ($Text -match '^[=+@\t\r]' -or ($Text -match '^-' -and $Text -notmatch '^-\d+([.,]\d+)?$')) { return "'" + $Text }
+    return $Text
+}
+
 function Get-GridExportData {
     # Gridde GORUNEN kolonlar (aktif filtre varsa sadece filtrelenmis satirlar).
     # -WithDetail: Panel 1'deki satir detay logunu 'Detay' kolonu olarak ekler.
@@ -1484,11 +1951,11 @@ function Get-GridExportData {
     $out = foreach ($drv in $Source) {
         $h = [ordered]@{}
         foreach ($col in $Grid.Columns) {
-            if ($col.Visible -and ($SkipColumns -notcontains $col.Name)) { $h[$col.HeaderText] = [string]$drv[$col.DataPropertyName] }
+            if ($col.Visible -and ($SkipColumns -notcontains $col.Name)) { $h[$col.HeaderText] = Protect-CellText ([string]$drv[$col.DataPropertyName]) }
         }
         if ($WithDetail) {
             $hn = [string]$drv['Hostname']
-            $h['Detay'] = if ($script:Details.ContainsKey($hn)) { ($script:Details[$hn] -replace '\s*\r?\n\s*', ' | ').Trim(' ', '|') } else { '' }
+            $h['Detay'] = if ($script:Details.ContainsKey($hn)) { Protect-CellText (($script:Details[$hn] -replace '\s*\r?\n\s*', ' | ').Trim(' ', '|')) } else { '' }
         }
         [pscustomobject]$h
     }
@@ -1524,18 +1991,18 @@ function Get-ColumnMap {
 
 function Set-GridFilter {
     # Secili kolonda (veya tum kolonlarda) 'icerir' filtresi uygular.
-    param($Source, $ColMap, [string]$ColumnHeader, [string]$Text)
+    # -StateColumn / -State: ozet cubugundan secilen durum (V7) metin filtresiyle AND'lenir.
+    param($Source, $ColMap, [string]$ColumnHeader, [string]$Text, [string]$StateColumn = '', [string]$State = '')
 
+    $parts = @()
     $q = "$Text".Trim()
-    if ([string]::IsNullOrWhiteSpace($q)) { $Source.RemoveFilter(); return }
-
-    $esc = Format-LikeValue -Text $q
-    if ($ColumnHeader -and $ColMap.Contains($ColumnHeader)) {
-        $Source.Filter = "[$($ColMap[$ColumnHeader])] LIKE '%$esc%'"
+    if ($q) {
+        $esc = Format-LikeValue -Text $q
+        if ($ColumnHeader -and $ColMap.Contains($ColumnHeader)) { $parts += "[$($ColMap[$ColumnHeader])] LIKE '%$esc%'" }
+        else { $parts += '(' + ((@($ColMap.Values) | ForEach-Object { "[$_] LIKE '%$esc%'" }) -join ' OR ') + ')' }
     }
-    else {
-        $Source.Filter = ((@($ColMap.Values) | ForEach-Object { "[$_] LIKE '%$esc%'" }) -join ' OR ')
-    }
+    if ($StateColumn -and $State) { $parts += "[$StateColumn] = '$State'" }
+    if ($parts.Count -eq 0) { $Source.RemoveFilter() } else { $Source.Filter = ($parts -join ' AND ') }
 }
 
 # ---------- Update Parser (Panel 2) - Panel 1'den BAGIMSIZ ----------
@@ -1666,9 +2133,11 @@ function ConvertTo-ParserCheckValues {
     param($Check)
     return @{
         DNS_Durumu     = [string]$Check.DnsStatus
-        Online_mi      = $(if ($Check.IsOnline) { 'Evet' } else { 'Hayir' })
+        Online_mi      = [string]$Check.OnlineText
         AD_Durumu      = [string]$Check.AdStatus
         AD_LastLogon   = [string]$Check.LastLogon
+        Calisan_Servisler    = [string]$Check.Running
+        Calismayan_Servisler = [string]$Check.NotRunning
         CcmExec_Durumu = [string]$Check.CcmExec
         SCCM_Kayit     = [string]$Check.SccmKayit
     }
@@ -1695,14 +2164,16 @@ function Update-ParserFromCheck {
 
     $c = @($Output | Where-Object { $_ -and $_.PSObject.Properties['SccmKayit'] })[0]
     if (-not $c) {
-        $msg = "Islem hatasi: $ErrorText"
-        Set-ParserCheckValues -HostName $Key -Values @{ DNS_Durumu = $msg; Online_mi = ''; AD_Durumu = ''; AD_LastLogon = ''; CcmExec_Durumu = ''; SCCM_Kayit = '' }
+        $msg = (Format-JobError $ErrorText)
+        $v = @{}; foreach ($cn in $script:ParserCheckColumns) { $v[$cn] = '' }; $v['DNS_Durumu'] = $msg
+        Set-ParserCheckValues -HostName $Key -Values $v
         Add-ParserDetail -Hostname $Key -Text "Kontrol: $msg"
         return
     }
 
     Set-ParserCheckValues -HostName $Key -Values (ConvertTo-ParserCheckValues -Check $c)
-    $d = "Kontrol: DNS=$($c.DnsStatus); Online=$($c.IsOnline); AD=$($c.AdStatus); LastLogon=$($c.LastLogon); CcmExec=$($c.CcmExec); SCCM kaydi=$($c.SccmKayit)"
+    Set-ParserSvcState -Check $c
+    $d = "Kontrol: DNS=$($c.DnsStatus); Online=$($c.OnlineText); AD=$($c.AdStatus); LastLogon=$($c.LastLogon); Calisan=$($c.Running); Calismayan=$($c.NotRunning); CcmExec=$($c.CcmExec); SCCM kaydi=$($c.SccmKayit)"
     if ($c.Note) { $d += "`r`nNot: $($c.Note)" }
     Add-ParserDetail -Hostname $Key -Text $d
 }
@@ -1714,7 +2185,7 @@ function Update-ParserFromScript {
 
     $r = @($Output | Where-Object { $_ -and $_.PSObject.Properties['Output'] -and $_.PSObject.Properties['Check'] })[0]
     if (-not $r) {
-        $msg = "Islem hatasi: $ErrorText"
+        $msg = (Format-JobError $ErrorText)
         $r0 = Add-ParserLines -SourceHost $Key -Text ''
         Add-ParserInfoRow -SourceHost $Key -Hostname $Key -Message $msg -At $r0.Pos
         $script:ParserNoOutput[$Key] = $true
@@ -1736,29 +2207,57 @@ function Update-ParserFromScript {
     }
 
     Set-ParserCheckValues -HostName $hn -Values (ConvertTo-ParserCheckValues -Check $chk)
+    Set-ParserSvcState -Check $chk
 
-    $d = "$($r.Action): $($r.Result)`r`nDNS=$($chk.DnsStatus); Online=$($chk.IsOnline); AD=$($chk.AdStatus); LastLogon=$($chk.LastLogon); CcmExec=$($chk.CcmExec); SCCM kaydi=$($chk.SccmKayit)"
+    $d = "$($r.Action): $($r.Result)`r`nDNS=$($chk.DnsStatus); Online=$($chk.OnlineText); AD=$($chk.AdStatus); LastLogon=$($chk.LastLogon); Calisan=$($chk.Running); Calismayan=$($chk.NotRunning); CcmExec=$($chk.CcmExec); SCCM kaydi=$($chk.SccmKayit)"
     if ($chk.Note) { $d += "`r`nNot: $($chk.Note)" }
     if ($r.Detail) { $d += "`r`n$($r.Detail)" }
     Add-ParserDetail -Hostname $hn -Text $d
     Write-ActionLog -Hostname $hn -Action $r.Action -State $r.State -Text $r.Result
 }
 
+function Set-ParserSvcState {
+    # Panel 2 "Servisleri Baslat" icin hostun son servis durumunu saklar
+    param($Check)
+    if (-not $Check -or -not $Check.Hostname) { return }
+    $script:ParserSvc[[string]$Check.Hostname] = [pscustomobject]@{ Hostname = [string]$Check.Hostname; IsOnline = [bool]$Check.IsOnline; ServiceDetail = @($Check.ServiceDetail) }
+}
+
+function Update-ParserFromFix {
+    # Panel 2 "Servisleri Baslat" sonucu: hostun TUM satirlarinda servis kolonlari guncellenir. Panel 1'e DOKUNMAZ.
+    param($Key, $Output, $ErrorText)
+    $f = ConvertFrom-FixRows $Output
+    if (-not $f) {
+        $msg = Format-JobError $ErrorText
+        Set-ParserCheckValues -HostName $Key -Values @{ Calismayan_Servisler = "Servis baslatma: $msg" }
+        Add-ParserDetail -Hostname $Key -Text "Servis baslatma: $msg"
+        Write-ActionLog -Hostname $Key -Action 'Servis baslat (Parser)' -State 'fail' -Text $msg
+        Add-FixReport -Hostname $Key -Status $msg
+        return
+    }
+    Add-FixReport -Hostname $Key -Status $f.Summary -Fix $f
+    $e = $script:ParserSvc[$Key]
+    if ($e) { $e.ServiceDetail = $f.ServiceDetail }
+    Set-ParserCheckValues -HostName $Key -Values @{ Calisan_Servisler = $f.Running; Calismayan_Servisler = $f.NotRunning }
+    Add-ParserDetail -Hostname $Key -Text "$($f.Detail)`r`nOzet: $($f.Summary)"
+    Write-ActionLog -Hostname $Key -Action 'Servis baslat (Parser)' -State $f.State -Text $f.Summary
+}
+
 function Start-ParserChecks {
     # Verilen hostlar icin DNS / AD / SCCM ajan kontrolunu (Panel 2 isi olarak) baslatir.
     param([string[]]$Hosts)
 
-    $allDc = [bool]$chkAllDc.Checked
     foreach ($h in $Hosts) {
         $pv = @{}
         foreach ($c in $script:ParserCheckColumns) { $pv[$c] = $script:PendingText }
         Set-ParserCheckValues -HostName $h -Values $pv
     }
 
+    $svc = @(Get-ServiceList)
     $items = @(foreach ($h in $Hosts) {
-        [pscustomobject]@{ Key = $h; Params = @{ ComputerName = $h; SmsProvider = [string]$script:SmsServer; SiteCode = [string]$script:SiteCode; QueryAllDCs = $allDc } }
+        [pscustomobject]@{ Key = $h; Params = @{ ComputerName = $h; SmsProvider = [string]$script:SmsServer; SiteCode = [string]$script:SiteCode; ServiceNames = $svc } }
     })
-    Start-ParallelRun -Title 'Parser kontrolu (DNS / AD / SCCM ajan)' -Worker $script:ParserCheckWorker -Items $items -OnResultFn 'Update-ParserFromCheck' -Panel 2
+    Start-SccmPrefetch -Panel 2 -Items $items -RunArgs @{ Title = 'Parser kontrolu (DNS / AD / servis / SCCM ajan)'; Worker = $script:ParserCheckWorker; OnResultFn = 'Update-ParserFromCheck'; Panel = 2 }
 }
 
 # ---------- Hedef secimi ----------
@@ -1768,8 +2267,7 @@ function Get-ComputerList {
     $valid = @()
     $bad = @()
     foreach ($n in $raw) {
-        # Türkçe karakterleri (İ, ı, Ş, ş, Ğ, ğ, Ü, ü, Ö, ö, Ç, ç) destekleyecek şekilde güncellendi
-        if ($n -match '^[A-Za-zİıŞşĞğÜüÖöÇç0-9][A-Za-zİıŞşĞğÜüÖöÇç0-9._-]*$') {
+        if ($n -match $script:HostRegex) {   # Turkce karakterler dahil; Panel 1 ve 2 ayni kural
             if ($valid -notcontains $n) { $valid += $n }
         }
         else { $bad += $n }
@@ -1785,17 +2283,11 @@ function Get-ComputerList {
 }
 
 function Get-TargetHosts {
-    # Verilen gridde secili satirlar (Hostname kolonu) varsa onlar, yoksa soldaki listedeki tum makineler.
+    # Verilen gridde secili hucrelerin satirlari (Hostname kolonu) varsa onlar, yoksa soldaki listedeki tum makineler.
     param($Grid = $dgv)
 
-    $sel = @()
-    foreach ($row in $Grid.SelectedRows) {
-        $h = [string]$row.Cells['Hostname'].Value
-        if ($h -and ($h -match $script:HostRegex) -and ($sel -notcontains $h)) { $sel += $h }
-    }
-    if ($sel.Count -gt 0) {
-        return [pscustomobject]@{ Hosts = $sel; Source = 'gridde secili satirlar' }
-    }
+    $sel = @(Get-SelectedHosts -Grid $Grid)
+    if ($sel.Count -gt 0) { return [pscustomobject]@{ Hosts = $sel; Source = 'gridde secili satirlar' } }
     $list = @(Get-ComputerList)
     if ($list.Count -eq 0) { return $null }
     return [pscustomobject]@{ Hosts = $list; Source = 'soldaki listedeki tum makineler' }
@@ -1806,6 +2298,41 @@ function Format-HostPreview {
     $txt = (@($Hosts | Select-Object -First $max) -join ', ')
     if (@($Hosts).Count -gt $max) { $txt += " ... (+$(@($Hosts).Count - $max))" }
     return $txt
+}
+
+function Start-ServiceFix {
+    # "Servisleri Baslat" (Panel 1 ve Panel 2 ayri): son kontrolde durdurulmus servisi olan cevrimici hostlar.
+    # Tabloda secim varsa SADECE secili hostlar hedeflenir. Sonuc sadece istegin geldigi panele yazilir.
+    param([int]$Panel)
+
+    $grid = if ($Panel -eq 2) { $dgvParse } else { $dgv }
+    $map  = if ($Panel -eq 2) { $script:ParserSvc } else { $script:LastResults }
+    $sel  = New-NameMap
+    foreach ($h in @(Get-SelectedHosts -Grid $grid)) { $sel[$h] = 1 }
+    $targets = @($map.Values | Where-Object {
+        $_.IsOnline -and ($sel.Count -eq 0 -or $sel.ContainsKey($_.Hostname)) -and
+        @($_.ServiceDetail | Where-Object { $_.Status -ne 'Running' -and $_.Status -ne 'NotFound' -and $_.Status -ne 'Erisilemedi' }).Count -gt 0
+    })
+    if ($targets.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Baslatilacak bir servis bulunamadi ($(if ($sel.Count) { 'secili satirlarda ' })hepsi calisiyor / bulunamadi / erisilemedi ya da makine cevrimdisi).", 'Bilgi') | Out-Null
+        return
+    }
+    $scope = if ($sel.Count) { 'secili satirlar' } else { 'tablodaki tum cihazlar' }
+    $confirm = [System.Windows.Forms.MessageBox]::Show(
+        "Panel ${Panel} ($scope): $($targets.Count) makinede durdurulmus servisler bulundu.`n$(Format-HostPreview -Hosts @($targets | ForEach-Object { $_.Hostname }))`n`nBaslatilsin mi? (Ayni anda en fazla $($script:MaxParallel) makine islenir)",
+        'Onay', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+    if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+    $items = @(foreach ($t in $targets) { [pscustomobject]@{ Key = $t.Hostname; Params = @{ ComputerName = $t.Hostname; ServiceDetail = $t.ServiceDetail } } })
+    $hosts = @($targets | ForEach-Object { $_.Hostname })
+    if ($Panel -eq 2) {
+        foreach ($h in $hosts) { Set-ParserCheckValues -HostName $h -Values @{ Calismayan_Servisler = $script:PendingText } }
+        Start-ParallelRun -Title 'Servis baslatma (Parser)' -Worker $script:FixWorker -Items $items -OnResultFn 'Update-ParserFromFix' -Panel 2
+    }
+    else {
+        Set-GridPending -Hosts $hosts -Columns @('ActionResult')
+        Start-ParallelRun -Title 'Servis baslatma' -Worker $script:FixWorker -Items $items -OnResultFn 'Update-GridFromFix'
+    }
 }
 
 function Start-ScriptSend {
@@ -1827,8 +2354,8 @@ function Start-ScriptSend {
 
     $timeout = [int]$nudTimeout.Value
 
-    $services = @($txtServices.Text -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    if ($Panel -eq 1 -and $services.Count -eq 0) {
+    $services = @(Get-ServiceList)
+    if ($services.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show('Servis kontrolu icin 1) Kontrol bolumune en az bir servis ismi girin.', 'Uyari') | Out-Null
         return
     }
@@ -1843,13 +2370,13 @@ function Start-ScriptSend {
     finally { $form.Cursor = [System.Windows.Forms.Cursors]::Default }
 
     if ($Panel -eq 2) {
-        $extra = "DNS / AD / SCCM ajan kontrolu de calistirilacak.`nSonuclar SADECE Panel 2'ye (Update Parser) yazilacak; Panel 1 etkilenmez."
+        $extra = "DNS / AD / servis ($($services -join ', ')) / SCCM ajan kontrolu de calistirilacak.`nSonuclar SADECE Panel 2'ye (Update Parser) yazilacak; Panel 1 etkilenmez."
     }
     else {
         $extra = "AD yapisi kontrolu (DNS / ping / AD) ve servis kontrolu ($($services -join ', ')) de calistirilacak.`nSonuclar SADECE Panel 1'e yazilacak; Update Parser (Panel 2) etkilenmez."
     }
 
-    $msg = "Script: $($s.Name)  (v$($s.Version))`nYazar: $($s.Author)`n`nHedef ($($t.Source)): $(@($t.Hosts).Count) makine`n$(Format-HostPreview -Hosts $t.Hosts)`n`nCevap bekleme suresi: $timeout sn`n$extra`n`nScript bu makinelerde SYSTEM hesabiyla calisacak. Gonderilsin mi?"
+    $msg = "Script: $($s.Name)  (v$($s.Version))`nYazar: $($s.Author)`n`nHedef ($($t.Source)): $(@($t.Hosts).Count) makine`n$(Format-HostPreview -Hosts $t.Hosts)`n`nCevap bekleme suresi: $timeout sn`n$extra`n`nCevrimdisi (ya da kimligi dogrulanamayan) cihazlara script GONDERILMEZ.`nScript bu makinelerde SYSTEM hesabiyla calisacak. Gonderilsin mi?"
     if ($param.HasParams) {
         $msg += "`n`nUYARI: Bu script parametre tanimliyor; parametreler BOS gonderilecek."
     }
@@ -1858,7 +2385,6 @@ function Start-ScriptSend {
     if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
     $b64   = $param.Param
-    $allDc = [bool]$chkAllDc.Checked
     $items = @(foreach ($h in $t.Hosts) {
         $p = @{
             ComputerName = $h
@@ -1868,9 +2394,8 @@ function Start-ScriptSend {
             ScriptName   = $s.Name
             ParamB64     = $b64
             TimeoutSec   = $timeout
-            QueryAllDCs  = $allDc
+            ServiceNames = $services
         }
-        if ($Panel -eq 1) { $p['ServiceNames'] = $services }   # Panel 2 worker'i bu parametreyi almaz
         [pscustomobject]@{ Key = $h; Params = $p }
     })
     Save-Settings
@@ -1878,217 +2403,651 @@ function Start-ScriptSend {
     if ($Panel -eq 2) {
         foreach ($h in $t.Hosts) { Add-ParserPendingRow -HostName $h }
         Update-ParserInfo
-        Start-ParallelRun -Title 'Script + DNS/AD/SCCM (Parser)' -Worker $script:ParserScriptWorker -Items $items -OnResultFn 'Update-ParserFromScript' -Panel 2
+        Start-SccmPrefetch -Panel 2 -Items $items -RunArgs @{ Title = 'Script + DNS/AD/servis/SCCM (Parser)'; Worker = $script:ParserScriptWorker; OnResultFn = 'Receive-ScriptSend2'; Panel = 2 }
     }
     else {
         Set-GridPending -Hosts $t.Hosts -ClearError -Columns @('DnsStatus', 'IsOnline', 'AdStatus', 'LastLogon', 'Running', 'NotRunning', 'CcmExec', 'ActionResult')
-        Start-ParallelRun -Title 'Script + AD + servis kontrolu' -Worker $script:ScriptWorker -Items $items -OnResultFn 'Update-GridFromScript' -Panel 1
+        Start-SccmPrefetch -Panel 1 -Items $items -RunArgs @{ Title = 'Script + AD + servis kontrolu'; Worker = $script:ScriptWorker; OnResultFn = 'Receive-ScriptSend1'; Panel = 1 }
     }
 }
+# ---------- V2: SCCM kayitlarini toplu on-alma ----------
+
+function Start-SccmPrefetch {
+    # Ise baslamadan once tum hedeflerin SCCM kaydi (SMS_R_System) arka planda TEK (parcali) sorguyla alinir;
+    # bitince her ise SccmInfo eklenip Start-ParallelRun cagrilir. Worker'lar SMS Provider'a kayit sorgusu ATMAZ.
+    # SCCM baglantisi yoksa dogrudan baslatilir.
+    param([int]$Panel, [object[]]$Items, [hashtable]$RunArgs)
+    if (-not $script:SmsServer -or -not $script:SiteCode -or @($Items).Count -eq 0) { Start-ParallelRun @RunArgs -Items $Items; return }
+
+    $ps = [powershell]::Create()
+    $ps.RunspacePool = (Get-SharedPool)
+    [void]$ps.AddScript($script:SccmMapWorker).AddParameters(@{ Names = [string[]]@($Items | ForEach-Object { $_.Key }); SmsProvider = $script:SmsServer; SiteCode = $script:SiteCode })
+    [void]$script:Prefetch.Add([pscustomobject]@{ Panel = $Panel; Items = $Items; RunArgs = $RunArgs; Job = [pscustomobject]@{ PS = $ps; Async = $ps.BeginInvoke(); Key = 'sccm'; Done = $false } })
+    Set-UiBusy -Panel $Panel -Busy $true
+    $lbl = if ($Panel -eq 2) { $lblParserStatus } else { $lblStatus }
+    $lbl.ForeColor = [System.Drawing.Color]::DarkBlue
+    $lbl.Text = "SCCM kayitlari aliniyor: $(@($Items).Count) cihaz (toplu sorgu)..."
+    if (-not $script:RunTimer.Enabled) { $script:RunTimer.Start() }
+}
+
+function Update-Prefetch {
+    # RunTimer'dan: biten on-alma isinin sonucunu islere dagitip asil isi baslatir.
+    foreach ($pf in @($script:Prefetch)) {
+        if (-not $pf.Job.Async.IsCompleted) { continue }
+        [void]$script:Prefetch.Remove($pf)
+        $r = Complete-Job $pf.Job
+        $map = @($r.Out | Where-Object { $_ -is [hashtable] })[0]
+        foreach ($it in $pf.Items) {   # kayit yoksa SccmInfo verilmez: worker eskisi gibi cihaz basina sorgular
+            $k = (([string]$it.Key -split '\.')[0])
+            if ($map -and $map.ContainsKey($k)) { $it.Params['SccmInfo'] = $map[$k] }
+        }
+        $a = $pf.RunArgs
+        Start-ParallelRun @a -Items $pf.Items
+    }
+}
+
+# ---------- V6: Basarisizlari tekrar dene ----------
+
+function Get-FailedHosts {
+    # Son islemin (LastOp) hedeflerinden sonucu HATA (kirmizi) olanlar. Panel 1: State = fail, Panel 2: Durum = fail.
+    param([int]$Panel)
+    $op = $script:LastOp[$Panel]
+    if (-not $op) { return @() }
+    $bad = New-NameMap
+    if ($Panel -eq 1) {
+        foreach ($row in $script:ResultsTable.Rows) { if ([string]$row['State'] -eq 'fail') { $bad[[string]$row['Hostname']] = 1 } }
+    }
+    else {
+        Update-SummaryNow -Panel 2
+        foreach ($row in $script:ParseTable.Rows) {
+            if ([string]$row['Durum'] -eq 'fail') { $bad[[string]$row['Hostname']] = 1; $bad[[string]$row['SourceHost']] = 1 }
+        }
+    }
+    return @($op.Items | Where-Object { $bad.ContainsKey([string]$_.Key) })
+}
+
+function Start-Retry {
+    param([int]$Panel)
+    if (Test-PanelBusy -Panel $Panel) { return }
+    $op = $script:LastOp[$Panel]
+    if (-not $op) { [System.Windows.Forms.MessageBox]::Show('Bu panelde tekrar denenecek bir islem yok.', 'Bilgi') | Out-Null; return }
+    $items = @(Get-FailedHosts -Panel $Panel)
+    if ($items.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show("Son islemde ($($op.RunArgs.Title)) hata alan cihaz yok.", 'Bilgi') | Out-Null; return }
+
+    $hosts = @($items | ForEach-Object { [string]$_.Key })
+    $warn = if ($op.RunArgs.OnResultFn -like 'Receive-ScriptSend*' -or $op.RunArgs.OnResultFn -in 'Update-GridFromAction', 'Update-GridFromFix', 'Update-ParserFromFix') { "`n`nDIKKAT: islem bu cihazlara TEKRAR gonderilecek (script / eylem / servis baslatma)." } else { '' }
+    $c = [System.Windows.Forms.MessageBox]::Show("Islem: $($op.RunArgs.Title)`n`nHata alan (kirmizi) $($hosts.Count) cihaz:`n$(Format-HostPreview -Hosts $hosts)$warn`n`nTekrar denensin mi?",
+        'Basarisizlari Tekrar Dene', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+    if ($c -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+    # Ayni parametrelerle yeni is nesneleri (Params kopyalanir; ayni hashtable iki iste kullanilmasin)
+    $new = @($items | ForEach-Object { [pscustomobject]@{ Key = $_.Key; Params = $_.Params.Clone() } })
+    $fn = $op.RunArgs.OnResultFn
+    if ($Panel -eq 2) {
+        if ($fn -eq 'Receive-ScriptSend2') { foreach ($h in $hosts) { Add-ParserPendingRow -HostName $h }; Update-ParserInfo }
+        elseif ($fn -eq 'Update-ParserFromFix') { foreach ($h in $hosts) { Set-ParserCheckValues -HostName $h -Values @{ Calismayan_Servisler = $script:PendingText } } }
+        else { $pv = @{}; foreach ($cn in $script:ParserCheckColumns) { $pv[$cn] = $script:PendingText }; foreach ($h in $hosts) { Set-ParserCheckValues -HostName $h -Values $pv } }
+    }
+    else {
+        $cols = if ($fn -in 'Update-GridFromCheck', 'Receive-ScriptSend1') { @('DnsStatus', 'IsOnline', 'AdStatus', 'LastLogon', 'Running', 'NotRunning', 'CcmExec', 'ActionResult') }
+                elseif ($fn -eq 'Update-GridFromAd') { @('DnsStatus', 'IsOnline', 'AdStatus', 'LastLogon', 'ActionResult') } else { @('ActionResult') }
+        Set-GridPending -Hosts $hosts -ClearError -Columns $cols
+    }
+    $a = $op.RunArgs.Clone()
+    $a.Title = "$($a.Title) - tekrar"
+    Start-ParallelRun @a -Items $new
+}
+
+# ---------- V7: Durum ozet cubugu ----------
+
+function Get-ParserRowState {
+    # Panel 2 satir durumu (ozet cubugu, filtre ve "tekrar dene" icin): pending / fail / warn / ok
+    param($Row)
+    foreach ($c in @('UpdateName') + $script:ParserCheckColumns) { if ([string]$Row[$c] -eq $script:PendingText) { return 'pending' } }
+    $on = [string]$Row['Online_mi']; $dns = [string]$Row['DNS_Durumu']; $ku = [string]$Row['KolonUyumu']
+    if ($on -like 'Hayir*' -or $dns -match '^(No such host|DNS hatasi|Islem hatasi|Iptal edildi)' -or $ku -eq 'Cikti yok') { return 'fail' }
+    $nr = [string]$Row['Calismayan_Servisler']; $cc = [string]$Row['CcmExec_Durumu']; $ad = [string]$Row['AD_Durumu']; $sk = [string]$Row['SCCM_Kayit']
+    if ($ku -notlike 'OK*' -or ($nr -and $nr -notlike 'Kontrol edilemedi*') -or ($cc -and $cc -ne 'Running') -or ($ad -and $ad -ne 'Enabled') -or
+        $on -eq 'Evet (dogrulanamadi)' -or $sk -like 'SCCM de kayitli degil*' -or $sk -like 'Kayit var*') { return 'warn' }
+    return 'ok'
+}
+
+function Update-SummaryNow {
+    # Panel 2: degisen satirlarin Durum'u yeniden hesaplanir. Sonra sayaclar tum tablodan sayilir.
+    param([int]$Panel)
+    if ($Panel -eq 2) {
+        $rows = @($script:DirtyRows)
+        $script:DirtyRows.Clear()
+        foreach ($row in $rows) {
+            if ($row.RowState -eq 'Detached' -or $row.RowState -eq 'Deleted') { continue }
+            $st = Get-ParserRowState $row
+            if ([string]$row['Durum'] -ne $st) { $row['Durum'] = $st }
+        }
+        $script:DirtyRows.Clear()   # Durum yazimi satiri tekrar kirli isaretler; deger degismedigi icin gerek yok
+    }
+    # DIKKAT: DataTable 'if' / pipeline ciktisi olarak dondurulurse PowerShell onu SATIRLARINA acar; dogrudan atanir.
+    $tbl = $script:ResultsTable; $col = 'State'
+    if ($Panel -eq 2) { $tbl = $script:ParseTable; $col = 'Durum' }
+    $n = @{ ok = 0; warn = 0; fail = 0; pending = 0 }
+    foreach ($row in $tbl.Rows) { $v = [string]$row[$col]; if ($n.ContainsKey($v)) { $n[$v]++ } }
+    $b = $script:SumButtons[$Panel]
+    $b.ok.Text = "Tamam: $($n.ok)"; $b.warn.Text = "Uyari: $($n.warn)"; $b.fail.Text = "Hata: $($n.fail)"; $b.pending.Text = "Bekleyen: $($n.pending)"
+    $b.all.Text = "Tumu: $($tbl.Rows.Count)"
+    $script:RetryButtons[$Panel].Enabled = ($n.fail -gt 0 -and $script:LastOp[$Panel] -and -not (Test-PanelBusy -Panel $Panel))
+    $script:SumDirty[$Panel] = $false
+}
+
+function Set-StateFilter {
+    # Ozet dugmesine tiklama: o duruma filtrele; ayni dugmeye tekrar ya da 'Tumu' -> durum filtresi kalkar.
+    param([int]$Panel, [string]$State)
+    if ($State -eq 'all' -or $script:StateFilter[$Panel] -eq $State) { $State = '' }
+    $script:StateFilter[$Panel] = $State
+    foreach ($k in @('ok', 'warn', 'fail', 'pending', 'all')) {
+        $btn = $script:SumButtons[$Panel][$k]
+        $on = ($k -eq $State) -or ($k -eq 'all' -and -not $State)
+        $btn.Font = New-Object System.Drawing.Font('Segoe UI', 8.25, $(if ($on) { [System.Drawing.FontStyle]::Bold } else { [System.Drawing.FontStyle]::Regular }))
+    }
+    Update-Filter -Panel $Panel
+}
+
+function Update-Filter {
+    param([int]$Panel)
+    if ($Panel -eq 2) { Set-GridFilter -Source $script:ParseBinding -ColMap $script:ColMap2 -ColumnHeader ([string]$cboF2.SelectedItem) -Text $txtF2.Text -StateColumn 'Durum' -State $script:StateFilter[2] }
+    else { Set-GridFilter -Source $script:BindingSrc -ColMap $script:ColMap1 -ColumnHeader ([string]$cboF1.SelectedItem) -Text $txtF1.Text -StateColumn 'State' -State $script:StateFilter[1] }
+}
+
+function New-SummaryBar {
+    # Ikinci arac satiri: durum dugmeleri + "Basarisizlari Tekrar Dene" + otomatik yenileme
+    param([int]$Panel, $Parent)
+    $defs = @(@('ok', 'LightGreen'), @('warn', 'LightYellow'), @('fail', 'LightCoral'), @('pending', 'Gainsboro'), @('all', 'White'))
+    $script:SumButtons[$Panel] = @{}
+    $x = 6
+    foreach ($d in $defs) {
+        $b = New-Ctl Button '' $x 37 92 24 @{ FlatStyle = 'Flat'; BackColor = [System.Drawing.Color]::FromName($d[1]); Tag = "$Panel|$($d[0])" }
+        $b.Add_Click({ $p = ([string]$this.Tag).Split('|'); Set-StateFilter -Panel ([int]$p[0]) -State $p[1] })
+        $script:SumButtons[$Panel][$d[0]] = $b
+        $Parent.Controls.Add($b)
+        $x += 96
+    }
+    $r = New-Ctl Button 'Basarisizlari Tekrar Dene' ($x + 8) 36 170 26 @{ Enabled = $false; Tag = $Panel }
+    $r.Add_Click({ Start-Retry -Panel ([int]$this.Tag) })
+    $script:RetryButtons[$Panel] = $r
+    $chk = New-Ctl CheckBox 'Otomatik yenile (dk):' ($x + 196) 40 0 0 @{ Tag = $Panel }
+    $nud = New-Ctl NumericUpDown '' ($x + 340) 38 50 23 @{ Minimum = 1; Maximum = 240 }
+    $nud.Value = 10
+    $lbl = New-Ctl Label '' ($x + 398) 42 0 0 $gray
+    $chk.Add_CheckedChanged({ Reset-AutoRefresh -Panel ([int]$this.Tag) })
+    $nud.Tag = $Panel
+    $nud.Add_ValueChanged({ Reset-AutoRefresh -Panel ([int]$this.Tag) })
+    $script:Auto[$Panel] = [pscustomobject]@{ Check = $chk; Minutes = $nud; Label = $lbl; Next = [datetime]::MaxValue }
+    $Parent.Controls.AddRange(@($r, $chk, $nud, $lbl))
+    Set-StateFilter -Panel $Panel -State ''
+}
+
+# ---------- V13: Periyodik yenileme ----------
+
+function Reset-AutoRefresh {
+    param([int]$Panel)
+    $a = $script:Auto[$Panel]
+    if ($a.Check.Checked) { $a.Next = (Get-Date).AddMinutes([int]$a.Minutes.Value); $a.Label.Text = "Sonraki: $($a.Next.ToString('HH:mm'))" }
+    else { $a.Next = [datetime]::MaxValue; $a.Label.Text = '' }
+}
+
+function Invoke-AutoRefresh {
+    # AutoTimer (15 sn): zamani gelen ve mesgul olmayan panelde tablodaki TUM cihazlar icin kontrol tekrarlanir.
+    # Panel 1: Kontrol (DNS / Online / AD / servis), Panel 2: Kontrolleri Calistir. Tablo silinmez, satirlar yerinde guncellenir.
+    foreach ($p in 1, 2) {
+        $a = $script:Auto[$p]
+        if (-not $a -or -not $a.Check.Checked -or (Get-Date) -lt $a.Next) { continue }
+        if (Test-PanelBusy -Panel $p) { $a.Label.Text = 'Sonraki: panel mesgul, bekleniyor'; continue }
+        $tbl = $script:ResultsTable
+        if ($p -eq 2) { $tbl = $script:ParseTable }   # 'if' ciktisi olarak atanmaz (DataTable satirlarina acilir)
+        $seen = New-NameMap
+        $hosts = @(foreach ($row in $tbl.Rows) { $h = [string]$row['Hostname']; if ($h -match $script:HostRegex -and -not $seen.ContainsKey($h)) { $seen[$h] = 1; $h } })
+        $svc = @(Get-ServiceList)
+        Reset-AutoRefresh -Panel $p
+        if ($hosts.Count -eq 0 -or ($p -eq 1 -and $svc.Count -eq 0)) { $a.Label.Text += ' (tablo bos / servis listesi bos - atlandi)'; continue }
+        Write-ActionLog -Hostname '-' -Action "Otomatik yenileme (Panel $p)" -State 'ok' -Text "$($hosts.Count) cihaz"
+        if ($p -eq 2) { Start-ParserChecks -Hosts $hosts } else { Start-Check -Hosts $hosts -Services $svc }
+    }
+}
+
+function Start-Check {
+    # Panel 1 "Kontrol": -Reset ile tablo bastan kurulur (Kontrol Et), aksi halde satirlar yerinde guncellenir (otomatik yenileme).
+    param([string[]]$Hosts, [string[]]$Services, [switch]$Reset)
+    if ($Reset) {
+        $script:ResultsTable.Rows.Clear()
+        $script:LastResults.Clear()
+        $script:Details.Clear()
+    }
+    $items = @(foreach ($h in $Hosts) { [pscustomobject]@{ Key = $h; Params = @{ ComputerName = $h; ServiceNames = $Services } } })
+    Set-GridPending -Hosts $Hosts -ClearError -Columns @('DnsStatus', 'IsOnline', 'AdStatus', 'LastLogon', 'Running', 'NotRunning', 'CcmExec')
+    if ($Reset) { try { $dgv.ClearSelection(); $dgv.CurrentCell = $null } catch { } }   # otomatik secilen ilk satir hedefi daraltmasin
+    Start-ParallelRun -Title 'Kontrol' -Worker $script:CheckWorker -Items $items -OnResultFn 'Update-GridFromCheck'
+}
+
+# ---------- V14: Islem kaydi (denetim log) goruntuleyici ----------
+
+function Import-LogView {
+    # Secili ayin log dosyasini tabloya yukler (en yeni kayit en ustte).
+    $f = [string]$script:LogCbo.SelectedItem
+    $script:LogTbl.Clear()
+    if (-not $f) { return }
+    $path = Join-Path (Get-DataDir) $f
+    $lines = $null
+    for ($i = 0; $i -lt 3 -and $null -eq $lines; $i++) {
+        try { $lines = [System.IO.File]::ReadAllLines($path, [System.Text.Encoding]::UTF8) } catch { Start-Sleep -Milliseconds 200 }
+    }
+    if ($null -eq $lines) { $script:LogLbl.Text = "Okunamadi: $path"; return }
+    $script:LogTbl.BeginLoadData()
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        if (-not $lines[$i]) { continue }
+        $p = $lines[$i].Split("`t", 6)
+        $row = $script:LogTbl.NewRow()
+        for ($c = 0; $c -lt [Math]::Min(6, $p.Count); $c++) { $row[$c] = $p[$c] }
+        $script:LogTbl.Rows.Add($row)
+    }
+    $script:LogTbl.EndLoadData()
+    Update-LogFilter
+}
+
+function Update-LogFilter {
+    Set-GridFilter -Source $script:LogBs -ColMap $script:LogColMap -ColumnHeader '' -Text $script:LogTxt.Text
+    $script:LogLbl.Text = "$($script:LogBs.Count) / $($script:LogTbl.Rows.Count) kayit"
+}
+
+function Show-LogViewer {
+    $dir = Get-DataDir
+    $files = @(Get-ChildItem -LiteralPath $dir -Filter 'ClientTool_*.log' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | ForEach-Object { $_.Name })
+    if ($files.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show("Henuz islem kaydi yok.`n$dir", 'Bilgi') | Out-Null; return }
+
+    $dlg = New-Ctl Form 'Islem Kayitlari (denetim kaydi)' 0 0 1150 650 @{ StartPosition = 'CenterParent'; MinimumSize = (New-Object System.Drawing.Size(800, 400)); ShowInTaskbar = $false }
+    $top = New-Ctl Panel '' 0 0 0 0 @{ Dock = 'Top'; Height = 36 }
+    $script:LogCbo = New-Ctl ComboBox '' 36 7 170 23 @{ DropDownStyle = 'DropDownList' }
+    foreach ($f in $files) { [void]$script:LogCbo.Items.Add($f) }
+    $script:LogTxt = New-Ctl TextBox '' 262 7 260 23
+    $btnRef = New-Ctl Button 'Yenile' 530 5 75 27
+    $btnDir = New-Ctl Button 'Klasoru Ac' 611 5 90 27
+    $script:LogLbl = New-Ctl Label '' 712 11 0 0 $gray
+    $top.Controls.AddRange(@((New-Ctl Label 'Ay:' 6 11), $script:LogCbo, (New-Ctl Label 'Filtre:' 214 11), $script:LogTxt, $btnRef, $btnDir, $script:LogLbl))
+
+    $script:LogTbl = New-Object System.Data.DataTable
+    $script:LogTbl.Locale = [System.Globalization.CultureInfo]::InvariantCulture
+    $cols = @(@('Zaman', 11), @('Kullanici', 8), @('Hostname', 10), @('Islem', 18), @('Durum', 5), @('Aciklama', 48))
+    foreach ($c in $cols) { [void]$script:LogTbl.Columns.Add($c[0]) }
+    $script:LogBs = New-Object System.Windows.Forms.BindingSource
+    $script:LogBs.DataSource = $script:LogTbl
+    $grid = New-ResultGrid
+    $grid.AutoSizeColumnsMode = 'Fill'
+    foreach ($c in $cols) { [void]$grid.Columns.Add((New-GridColumn $c[0] $c[0] $c[1])) }
+    $grid.DataSource = $script:LogBs
+    $script:LogColMap = Get-ColumnMap -Grid $grid
+    $grid.add_CellFormatting({
+        param($s, $e)
+        if ($e.RowIndex -lt 0) { return }
+        switch ([string]$s.Rows[$e.RowIndex].Cells['Durum'].Value) {
+            'fail' { $e.CellStyle.BackColor = [System.Drawing.Color]::LightCoral }
+            'warn' { $e.CellStyle.BackColor = [System.Drawing.Color]::LightYellow }
+        }
+    })
+
+    $script:LogCbo.Add_SelectedIndexChanged({ Import-LogView })
+    $script:LogTxt.Add_TextChanged({ Update-LogFilter })
+    $btnRef.Add_Click({ Import-LogView })
+    $btnDir.Add_Click({ try { Invoke-Item -LiteralPath (Get-DataDir) } catch { } })
+
+    $dlg.Controls.AddRange(@($grid, $top))
+    $script:LogCbo.SelectedIndex = 0
+    [void]$dlg.ShowDialog($form)
+    $dlg.Dispose()
+}
+
+# ---------- Sag tik islemleri (secili satirlar) ----------
+
+function Get-GridPanel { param($Grid) if ($Grid -eq $dgvParse) { return 2 } return 1 }
+
+function Start-GridCheck {
+    # Sag tik > Durumu Kontrol Et: secili satirlarin cihazlari icin kontrol (tablo silinmez, satirlar yerinde guncellenir).
+    # Panel 1: DNS / Online / AD / servis. Panel 2: DNS / Online / AD / servis / SCCM kaydi.
+    param($Grid)
+    $panel = Get-GridPanel $Grid
+    if (Test-PanelBusy -Panel $panel) { return }
+    $hosts = @(Get-SelectedHosts -Grid $Grid)
+    if ($hosts.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('Secili satirlarda gecerli bir cihaz adi yok.', 'Bilgi') | Out-Null; return }
+    if ($panel -eq 2) { Start-ParserChecks -Hosts $hosts; return }
+    $svc = @(Get-ServiceList)
+    if ($svc.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('En az bir servis ismi girin.', 'Uyari') | Out-Null; return }
+    Start-Check -Hosts $hosts -Services $svc
+}
+
+function Add-FixReport {
+    # Calisan servis baslatma isinin raporuna host satiri ekler (is bitince Show-FixResultDialog ile gosterilir).
+    param([string]$Hostname, [string]$Status, $Fix)
+    $run = $script:CurrentRun
+    if (-not $run) { return }
+    if (-not $run.PSObject.Properties['Report']) { $run | Add-Member -NotePropertyName Report -NotePropertyValue (New-Object System.Collections.ArrayList) }
+    $detail = if ($Fix) { (($Fix.Detail -split "`r`n" | Select-Object -Skip 1 | ForEach-Object { $_.Trim() }) -join ' | ') } else { '' }
+    [void]$run.Report.Add([pscustomobject]@{ Hostname = $Hostname; Status = $Status; Ayrinti = $detail })
+}
+
+function Show-PendingReports {
+    # Biten servis baslatma islerinin raporlarini sirayla gosterir (ic ice pencere acilmaz).
+    if ($script:ShowingReport) { return }
+    $script:ShowingReport = $true
+    try {
+        while ($script:ReportQueue.Count -gt 0) {
+            $st = $script:ReportQueue[0]
+            $script:ReportQueue.RemoveAt(0)
+            Show-FixResultDialog -Title "$($st.Title) - Sonuc Raporu (Panel $($st.Panel))" -Data @($st.Report | Sort-Object Hostname)
+        }
+    }
+    finally { $script:ShowingReport = $false }
+}
+
+function Show-FixResultDialog {
+    # Servis baslatma sonuc raporu (ServisKontrolAraci ile ayni bicim): Hostname | Status (+ servis bazli Ayrinti).
+    # "Panoya Kopyala (Tablo)": tab ayracli -> Word / Outlook / Excel'e tablo olarak yapisir. "CSV Olarak Disa Aktar".
+    param([string]$Title, [object[]]$Data)
+    $dlg = New-Ctl Form $Title 0 0 1000 520 @{ StartPosition = 'CenterParent'; MinimumSize = (New-Object System.Drawing.Size(700, 350)); ShowInTaskbar = $false }
+    $grid = New-Ctl DataGridView '' 10 10 965 420 @{
+        Anchor = 'Top,Bottom,Left,Right'; ReadOnly = $true; AllowUserToAddRows = $false; AllowUserToDeleteRows = $false
+        AutoSizeColumnsMode = 'Fill'; RowHeadersVisible = $false; SelectionMode = 'CellSelect'; ClipboardCopyMode = 'EnableWithoutHeaderText'
+        BackgroundColor = [System.Drawing.Color]::White
+    }
+    foreach ($c in @(@('Hostname', 18), @('Status', 47), @('Ayrinti', 35))) {
+        $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $col.Name = $c[0]; $col.HeaderText = $c[0]; $col.FillWeight = $c[1]
+        [void]$grid.Columns.Add($col)
+    }
+    foreach ($d in $Data) {
+        $i = $grid.Rows.Add([string]$d.Hostname, [string]$d.Status, [string]$d.Ayrinti)
+        $st = [string]$d.Status
+        $grid.Rows[$i].DefaultCellStyle.BackColor = $(
+            if ($st -like '*kaldi*' -or $st -like 'Islem hatasi*' -or $st -like 'Iptal*' -or $st -like '*erisilemedi*') { [System.Drawing.Color]::LightCoral }
+            elseif ($st -like '*bulunamadi*') { [System.Drawing.Color]::LightYellow }
+            else { [System.Drawing.Color]::LightGreen })
+    }
+    $script:ReportData = $Data
+    $btnCopy  = New-Ctl Button 'Panoya Kopyala (Tablo)' 10 440 180 30 @{ Anchor = 'Bottom,Left' }
+    $btnCsv   = New-Ctl Button 'CSV Olarak Disa Aktar' 200 440 180 30 @{ Anchor = 'Bottom,Left' }
+    $btnClose = New-Ctl Button 'Kapat' 875 440 100 30 @{ Anchor = 'Bottom,Right'; DialogResult = [System.Windows.Forms.DialogResult]::Cancel }
+    $btnCopy.Add_Click({
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.AppendLine("Hostname`tStatus`tAyrinti")
+        foreach ($d in $script:ReportData) { [void]$sb.AppendLine("$($d.Hostname)`t$($d.Status)`t$($d.Ayrinti)") }
+        Copy-ToClipboard $sb.ToString()
+        [System.Windows.Forms.MessageBox]::Show('Tablo panoya kopyalandi. Word / Outlook / Excel gibi programlara yapistirabilirsiniz.', 'Bilgi') | Out-Null
+    })
+    $btnCsv.Add_Click({
+        $sfd = New-Object System.Windows.Forms.SaveFileDialog
+        $sfd.Filter = 'CSV Dosyasi (*.csv)|*.csv'
+        $sfd.FileName = "ServisBaslatmaRaporu_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+        if ($sfd.ShowDialog() -ne 'OK') { return }
+        try {
+            $script:ReportData | ForEach-Object { [pscustomobject]@{ Hostname = $_.Hostname; Status = (Protect-CellText $_.Status); Ayrinti = (Protect-CellText $_.Ayrinti) } } |
+                Export-Csv -Path $sfd.FileName -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+            [System.Windows.Forms.MessageBox]::Show("Disa aktarildi: $($sfd.FileName)", 'Bilgi') | Out-Null
+        }
+        catch { [System.Windows.Forms.MessageBox]::Show("CSV yazilamadi: $($_.Exception.Message)", 'Hata') | Out-Null }
+    })
+    $dlg.CancelButton = $btnClose
+    $dlg.Controls.AddRange(@($grid, $btnCopy, $btnCsv, $btnClose))
+    [void]$dlg.ShowDialog($form)
+    $dlg.Dispose()
+}
+
+function Start-GridRepair {
+    # Sag tik > Istemci Onarimi: secili cihazlarda SMS_Client.RepairClient (ccmrepair). Sonuc istegin geldigi panele yazilir.
+    param($Grid)
+    $panel = Get-GridPanel $Grid
+    if (Test-PanelBusy -Panel $panel) { return }
+    $hosts = @(Get-SelectedHosts -Grid $Grid)
+    if ($hosts.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show('Secili satirlarda gecerli bir cihaz adi yok.', 'Bilgi') | Out-Null; return }
+    $c = [System.Windows.Forms.MessageBox]::Show(
+        "Istemci onarimi (ccmrepair) - Panel ${panel}, secili $($hosts.Count) cihaz:`n$(Format-HostPreview -Hosts $hosts)`n`nccmrepair hedefte arka planda calisir (birkac dakika); bu sirada SCCM ajani yeniden baslar ve eylem / script almaz.`n`nBaslatilsin mi?",
+        'Onay - Istemci Onarimi', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($c -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    $name = 'Istemci Onarimi (RepairClient / ccmrepair)'
+    $items = @(foreach ($h in $hosts) { [pscustomobject]@{ Key = $h; Params = @{ ComputerName = $h; ActionName = $name; ScheduleIds = [string[]]@('@REPAIR') } } })
+    if ($panel -eq 2) {
+        foreach ($h in $hosts) { Set-ParserCheckValues -HostName $h -Values @{ CcmExec_Durumu = $script:PendingText } }
+        Start-ParallelRun -Title 'Istemci onarimi (Parser)' -Worker $script:ActionWorker -Items $items -OnResultFn 'Update-ParserFromAction' -Panel 2
+    }
+    else {
+        Set-GridPending -Hosts $hosts -Columns @('ActionResult')
+        Start-ParallelRun -Title 'Istemci onarimi' -Worker $script:ActionWorker -Items $items -OnResultFn 'Update-GridFromAction'
+    }
+}
+
+function Update-ParserFromAction {
+    # Panel 2'den baslatilan istemci eylemi (ccmrepair) sonucu: CcmExec_Durumu kolonuna + detaya yazilir. Panel 1'e DOKUNMAZ.
+    param($Key, $Output, $ErrorText)
+    $r = @($Output | Where-Object { $_ -and $_.PSObject.Properties['Action'] })[0]
+    if (-not $r) { $r = [pscustomobject]@{ Hostname = $Key; Action = 'Istemci onarimi'; State = 'fail'; Result = (Format-JobError $ErrorText); Detail = '' } }
+    $one = ("$($r.Result)" -replace '\s+', ' ').Trim()
+    Set-ParserCheckValues -HostName $Key -Values @{ CcmExec_Durumu = "Onarim: $one" }
+    Add-ParserDetail -Hostname $Key -Text ("$($r.Action): $($r.Result)" + $(if ($r.Detail) { "`r`n$($r.Detail)" } else { '' }))
+    Write-ActionLog -Hostname $Key -Action "$($r.Action) (Parser)" -State $r.State -Text $r.Result
+}
+
 # ==================== ANA FORM ====================
 
-$form = New-Object System.Windows.Forms.Form
-$form.Text = 'Istemci Durum ve SCCM Islem Araci'
-$form.Size = New-Object System.Drawing.Size(1360, 900)
-$form.StartPosition = 'CenterScreen'
-$form.MinimumSize = New-Object System.Drawing.Size(1150, 700)
+function New-Ctl {
+    # Kisa WinForms kontrol olusturucu: New-Ctl <Tip> <Metin> x y [w h] @{ Ozellik = Deger }
+    # w = 0 ise Label / CheckBox AutoSize olur.
+    param([string]$Type, [string]$Text = '', [int]$X = 0, [int]$Y = 0, [int]$W = 0, [int]$H = 0, [hashtable]$P = @{})
+    $c = New-Object "System.Windows.Forms.$Type"
+    if ($Text) { $c.Text = $Text }
+    $c.Location = New-Object System.Drawing.Point($X, $Y)
+    if ($W -gt 0) { $c.Size = New-Object System.Drawing.Size($W, $H) }
+    elseif ($c -is [System.Windows.Forms.Label] -or $c -is [System.Windows.Forms.CheckBox]) { $c.AutoSize = $true }
+    foreach ($k in $P.Keys) { $c.$k = $P[$k] }
+    return $c
+}
+$gray = @{ ForeColor = [System.Drawing.Color]::DimGray }
 
-$lblComputers = New-Object System.Windows.Forms.Label
-$lblComputers.Text = 'Bilgisayar Isimleri (her satira bir tane):'
-$lblComputers.Location = New-Object System.Drawing.Point(10, 10)
-$lblComputers.AutoSize = $true
+$form = New-Ctl Form 'Istemci Durum ve SCCM Islem Araci' 0 0 1360 900 @{ StartPosition = 'CenterScreen'; MinimumSize = (New-Object System.Drawing.Size(1150, 700)) }
 
-$txtComputers = New-Object System.Windows.Forms.TextBox
-$txtComputers.Multiline = $true
-$txtComputers.ScrollBars = 'Vertical'
-$txtComputers.Location = New-Object System.Drawing.Point(10, 30)
-$txtComputers.Size = New-Object System.Drawing.Size(200, 800)
-$txtComputers.Anchor = 'Top,Bottom,Left'
+$lblComputers = New-Ctl Label 'Bilgisayar Isimleri (her satira bir tane):' 10 10
+$txtComputers = New-Ctl TextBox '' 10 30 200 800 @{ Multiline = $true; ScrollBars = 'Vertical'; Anchor = 'Top,Bottom,Left' }
 
 # ---------- 1) Kontrol ----------
-$gbCheck = New-Object System.Windows.Forms.GroupBox
-$gbCheck.Text = '1) Kontrol (DNS / Online / AD / Servis)'
-$gbCheck.Location = New-Object System.Drawing.Point(220, 8)
-$gbCheck.Size = New-Object System.Drawing.Size(520, 184)
-
-$lblServices = New-Object System.Windows.Forms.Label
-$lblServices.Text = 'Servisler (virgulle ayirin):'
-$lblServices.Location = New-Object System.Drawing.Point(10, 22)
-$lblServices.AutoSize = $true
-
-$txtServices = New-Object System.Windows.Forms.TextBox
-$txtServices.Location = New-Object System.Drawing.Point(10, 42)
-$txtServices.Size = New-Object System.Drawing.Size(495, 23)
-$txtServices.Text = 'CcmExec, BITS, wuauserv'
-
-$chkAllDc = New-Object System.Windows.Forms.CheckBox
-$chkAllDc.Text = "AD: tum DC'lerden gercek lastLogon sorgula (yavas)"
-$chkAllDc.Location = New-Object System.Drawing.Point(10, 72)
-$chkAllDc.AutoSize = $true
-
-$btnCheck = New-Object System.Windows.Forms.Button
-$btnCheck.Text = 'Kontrol Et'
-$btnCheck.Location = New-Object System.Drawing.Point(10, 108)
-$btnCheck.Size = New-Object System.Drawing.Size(110, 32)
-
-$btnAd = New-Object System.Windows.Forms.Button
-$btnAd.Text = 'AD Yapisi Kontrolu'
-$btnAd.Location = New-Object System.Drawing.Point(130, 108)
-$btnAd.Size = New-Object System.Drawing.Size(150, 32)
-
-$btnFix = New-Object System.Windows.Forms.Button
-$btnFix.Text = 'Servisleri Baslat'
-$btnFix.Location = New-Object System.Drawing.Point(290, 108)
-$btnFix.Size = New-Object System.Drawing.Size(150, 32)
-$btnFix.Enabled = $false
-
-$lblAdHint = New-Object System.Windows.Forms.Label
-$lblAdHint.Text = 'AD Yapisi Kontrolu: DNS + ping + AD (var mi / Enabled-Disabled / Last Logon). Script gonderirken de otomatik calisir.'
-$lblAdHint.Location = New-Object System.Drawing.Point(10, 148)
-$lblAdHint.Size = New-Object System.Drawing.Size(500, 30)
-$lblAdHint.ForeColor = [System.Drawing.Color]::DimGray
-
-$gbCheck.Controls.AddRange(@($lblServices, $txtServices, $chkAllDc, $btnCheck, $btnAd, $btnFix, $lblAdHint))
+$gbCheck     = New-Ctl GroupBox '1) Kontrol (DNS / Online / AD / Servis)' 220 8 520 184
+$lblServices = New-Ctl Label 'Servisler (virgulle ayirin):' 10 22
+$txtServices = New-Ctl TextBox 'CcmExec, BITS, wuauserv' 10 42 495 23
+$btnCheck    = New-Ctl Button 'Kontrol Et' 10 78 110 32
+$btnAd       = New-Ctl Button 'AD Yapisi Kontrolu' 130 78 150 32
+$btnFix      = New-Ctl Button 'Servisleri Baslat' 290 78 150 32 @{ Enabled = $false }
+$btnAdCache  = New-Ctl Button 'AD Onbellegi...' 10 122 165 26
+$lblAdCache  = New-Ctl Label 'Onbellek: -' 182 128 328 18 $gray
+$lblAdHint   = New-Ctl Label 'AD bilgisi onbellekten (CSV) okunur; Online = ping + cihaz adi dogrulamasi.' 10 158 500 16 $gray
+$gbCheck.Controls.AddRange(@($lblServices, $txtServices, $btnCheck, $btnAd, $btnFix, $btnAdCache, $lblAdCache, $lblAdHint))
 
 # ---------- 2) SCCM Script ----------
-$gbSccm = New-Object System.Windows.Forms.GroupBox
-$gbSccm.Text = '2) SCCM Script'
-$gbSccm.Location = New-Object System.Drawing.Point(750, 8)
-$gbSccm.Size = New-Object System.Drawing.Size(580, 184)
-
-$lblSms = New-Object System.Windows.Forms.Label
-$lblSms.Text = 'SMS Provider (Site Server) adi:'
-$lblSms.Location = New-Object System.Drawing.Point(10, 22)
-$lblSms.AutoSize = $true
-
-$txtSms = New-Object System.Windows.Forms.TextBox
-$txtSms.Location = New-Object System.Drawing.Point(10, 42)
-$txtSms.Size = New-Object System.Drawing.Size(300, 23)
-
-$btnConnect = New-Object System.Windows.Forms.Button
-$btnConnect.Text = 'Baglan / Scriptleri Listele'
-$btnConnect.Location = New-Object System.Drawing.Point(320, 40)
-$btnConnect.Size = New-Object System.Drawing.Size(170, 27)
-
-$lblSite = New-Object System.Windows.Forms.Label
-$lblSite.Text = 'Site: -'
-$lblSite.Location = New-Object System.Drawing.Point(500, 46)
-$lblSite.AutoSize = $true
-
-$lblScript = New-Object System.Windows.Forms.Label
-$lblScript.Text = 'Script:'
-$lblScript.Location = New-Object System.Drawing.Point(10, 74)
-$lblScript.AutoSize = $true
-
-$cboScripts = New-Object System.Windows.Forms.ComboBox
-$cboScripts.Location = New-Object System.Drawing.Point(10, 94)
-$cboScripts.Size = New-Object System.Drawing.Size(410, 23)
-$cboScripts.DropDownStyle = 'DropDownList'
-
-$btnShowScript = New-Object System.Windows.Forms.Button
-$btnShowScript.Text = 'Icerik'
-$btnShowScript.Location = New-Object System.Drawing.Point(428, 92)
-$btnShowScript.Size = New-Object System.Drawing.Size(60, 27)
-$btnShowScript.Enabled = $false
-
-$lblTimeout = New-Object System.Windows.Forms.Label
-$lblTimeout.Text = 'Bekleme (sn):'
-$lblTimeout.Location = New-Object System.Drawing.Point(498, 74)
-$lblTimeout.AutoSize = $true
-
-$nudTimeout = New-Object System.Windows.Forms.NumericUpDown
-$nudTimeout.Location = New-Object System.Drawing.Point(498, 94)
-$nudTimeout.Size = New-Object System.Drawing.Size(65, 23)
-$nudTimeout.Minimum = 30
-$nudTimeout.Maximum = 900
+$gbSccm        = New-Ctl GroupBox '2) SCCM Script' 750 8 580 184
+$lblSms        = New-Ctl Label 'SMS Provider (Site Server) adi:' 10 22
+$txtSms        = New-Ctl TextBox '' 10 42 300 23
+$btnConnect    = New-Ctl Button 'Baglan / Scriptleri Listele' 320 40 170 27
+$lblSite       = New-Ctl Label 'Site: -' 500 46
+$lblScript     = New-Ctl Label 'Script:' 10 74
+$cboScripts    = New-Ctl ComboBox '' 10 94 410 23 @{ DropDownStyle = 'DropDownList' }
+$btnShowScript = New-Ctl Button 'Icerik' 428 92 60 27 @{ Enabled = $false }
+$lblTimeout    = New-Ctl Label 'Bekleme (sn):' 498 74
+$nudTimeout    = New-Ctl NumericUpDown '' 498 94 65 23 @{ Minimum = 30; Maximum = 900 }
 $nudTimeout.Value = 90
-
-$btnSendScript = New-Object System.Windows.Forms.Button
-$btnSendScript.Text = 'Secili Scripti Gonder (Panel 1)'
-$btnSendScript.Location = New-Object System.Drawing.Point(10, 124)
-$btnSendScript.Size = New-Object System.Drawing.Size(230, 28)
-$btnSendScript.Enabled = $false
-
-$lblScriptInfo = New-Object System.Windows.Forms.Label
-$lblScriptInfo.Text = ''
-$lblScriptInfo.Location = New-Object System.Drawing.Point(250, 131)
-$lblScriptInfo.AutoSize = $true
-$lblScriptInfo.ForeColor = [System.Drawing.Color]::DimGray
-
-$lblIndep = New-Object System.Windows.Forms.Label
-$lblIndep.Text = "Panel 1 ve Panel 2 bagimsizdir: bu buton sadece Panel 1'e yazar. Panel 2 icin Panel 2'deki 'Script Gonder (Panel 2)' butonunu kullanin."
-$lblIndep.Location = New-Object System.Drawing.Point(10, 154)
-$lblIndep.Size = New-Object System.Drawing.Size(560, 28)
-$lblIndep.ForeColor = [System.Drawing.Color]::DimGray
-
+$btnSendScript = New-Ctl Button 'Secili Scripti Gonder (Panel 1)' 10 124 230 28 @{ Enabled = $false }
+$lblScriptInfo = New-Ctl Label '' 250 131 0 0 $gray
+$lblIndep      = New-Ctl Label "Panel 1 ve Panel 2 bagimsizdir: bu buton sadece Panel 1'e yazar. Panel 2 icin Panel 2'deki 'Script Gonder (Panel 2)' butonunu kullanin." 10 154 560 28 $gray
 $gbSccm.Controls.AddRange(@($lblSms, $txtSms, $btnConnect, $lblSite, $lblScript, $cboScripts, $btnShowScript, $lblTimeout, $nudTimeout, $btnSendScript, $lblScriptInfo, $lblIndep))
 
 # ---------- 3) SCCM Istemci Eylemi ----------
-$gbActions = New-Object System.Windows.Forms.GroupBox
-$gbActions.Text = '3) SCCM Istemci Eylemi'
-$gbActions.Location = New-Object System.Drawing.Point(220, 200)
-$gbActions.Size = New-Object System.Drawing.Size(1110, 60)
-
-$cboAction = New-Object System.Windows.Forms.ComboBox
-$cboAction.Location = New-Object System.Drawing.Point(10, 25)
-$cboAction.Size = New-Object System.Drawing.Size(400, 23)
-$cboAction.DropDownStyle = 'DropDownList'
+$gbActions = New-Ctl GroupBox '3) SCCM Istemci Eylemi' 220 200 1110 60
+$cboAction = New-Ctl ComboBox '' 10 25 400 23 @{ DropDownStyle = 'DropDownList' }
 foreach ($k in $script:ClientActions.Keys) { [void]$cboAction.Items.Add($k) }
 $cboAction.SelectedIndex = 0
+$btnAction = New-Ctl Button 'Eylemi Gonder' 420 22 170 28
+$lblHint   = New-Ctl Label 'Hedef: gridde secili satirlar; yoksa soldaki liste.' 605 29 0 0 $gray
+$btnLog    = New-Ctl Button 'Islem Kayitlari...' 980 22 120 28
+$gbActions.Controls.AddRange(@($cboAction, $btnAction, $lblHint, $btnLog))
 
-$btnAction = New-Object System.Windows.Forms.Button
-$btnAction.Text = 'Eylemi Gonder'
-$btnAction.Location = New-Object System.Drawing.Point(420, 22)
-$btnAction.Size = New-Object System.Drawing.Size(170, 28)
+$btnCancel1 = New-Ctl Button 'Iptal Et' 220 266 90 24 @{ Enabled = $false }
+$lblStatus  = New-Ctl Label '' 318 270 0 0 @{ ForeColor = [System.Drawing.Color]::DarkBlue }
 
-$lblHint = New-Object System.Windows.Forms.Label
-$lblHint.Text = 'Panel 1 hedefi: gridde secili satirlar; yoksa soldaki liste (Script / AD icin de gecerli).'
-$lblHint.Location = New-Object System.Drawing.Point(605, 29)
-$lblHint.AutoSize = $true
-$lblHint.ForeColor = [System.Drawing.Color]::DimGray
-
-$gbActions.Controls.AddRange(@($cboAction, $btnAction, $lblHint))
-
-$lblStatus = New-Object System.Windows.Forms.Label
-$lblStatus.Text = ''
-$lblStatus.Location = New-Object System.Drawing.Point(220, 270)
-$lblStatus.AutoSize = $true
-$lblStatus.ForeColor = [System.Drawing.Color]::DarkBlue
-
-# ---------- Sonuc tablosu ----------
-$dgv = New-Object System.Windows.Forms.DataGridView
-$dgv.Dock = 'Fill'
-$dgv.ReadOnly = $true
-$dgv.AllowUserToAddRows = $false
-$dgv.AutoSizeColumnsMode = 'Fill'
-$dgv.RowHeadersVisible = $false
-$dgv.SelectionMode = 'FullRowSelect'
-$dgv.MultiSelect = $true
-$dgv.ClipboardCopyMode = 'EnableAlwaysIncludeHeaderText'
-$dgv.AutoGenerateColumns = $false
+# ---------- Tablo yardimcilari (Panel 1 + Panel 2 ortak) ----------
 
 function New-GridColumn {
-    param([string]$Name, [string]$Header, [float]$Weight, [bool]$Visible = $true)
+    param([string]$Name, [string]$Header, [float]$Weight, [bool]$Visible = $true, [int]$Width = 0)
     $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $col.Name = $Name
     $col.DataPropertyName = $Name
     $col.HeaderText = $Header
     $col.FillWeight = $Weight
     $col.Visible = $Visible
+    if ($Width -gt 0) { $col.Width = $Width }
     return $col
 }
 
+function New-ResultGrid {
+    # Hucre secilebilir sonuc tablosu: hucreye tiklamak hucreyi, satir basligina tiklamak tum satiri secer.
+    # Ctrl+C secili hucre(ler)i (basliksiz) kopyalar; Ctrl+Shift+C secili satirlari basliklariyla kopyalar.
+    $g = New-Object System.Windows.Forms.DataGridView
+    $g.Dock = 'Fill'
+    $g.ReadOnly = $true
+    $g.AllowUserToAddRows = $false
+    $g.AllowUserToDeleteRows = $false
+    $g.RowHeadersVisible = $true
+    $g.RowHeadersWidth = 26
+    $g.RowHeadersWidthSizeMode = 'DisableResizing'
+    $g.SelectionMode = 'RowHeaderSelect'
+    $g.MultiSelect = $true
+    $g.ClipboardCopyMode = 'EnableWithoutHeaderText'
+    $g.AutoGenerateColumns = $false
+    $g.ContextMenuStrip = $script:GridMenu
+    return $g
+}
+
+function Copy-ToClipboard {
+    param($Data)
+    if ($null -eq $Data -or ($Data -is [string] -and $Data.Length -eq 0)) { return }
+    try { [System.Windows.Forms.Clipboard]::SetDataObject($Data, $true, 10, 100) }
+    catch { [System.Windows.Forms.MessageBox]::Show("Panoya kopyalanamadi: $($_.Exception.Message)", 'Uyari') | Out-Null }
+}
+
+function Get-SelectedRowIndexes {
+    param($Grid)
+    $idx = @($Grid.SelectedCells | ForEach-Object { $_.RowIndex } | Sort-Object -Unique)
+    if ($idx.Count -eq 0 -and $Grid.CurrentCell) { $idx = @($Grid.CurrentCell.RowIndex) }
+    return $idx
+}
+
+function Get-SelectedHosts {
+    # Secili hucrelerin bulundugu satirlardaki gecerli, tekil Hostname'ler
+    param($Grid)
+    $seen = New-NameMap
+    $out = @()
+    foreach ($i in @($Grid.SelectedCells | ForEach-Object { $_.RowIndex } | Sort-Object -Unique)) {
+        $h = [string]$Grid.Rows[$i].Cells['Hostname'].Value
+        if ($h -and $h -match $script:HostRegex -and -not $seen.ContainsKey($h)) { $seen[$h] = 1; $out += $h }
+    }
+    return $out
+}
+
+function Copy-GridData {
+    # Mode: Cells (secili hucreler) | Rows (secili satirlar + baslik) | Column (aktif sutun, gorunen tum satirlar) | Hosts
+    param($Grid, [string]$Mode)
+    $cols = @($Grid.Columns | Where-Object { $_.Visible } | Sort-Object DisplayIndex)
+    switch ($Mode) {
+        'Cells' { Copy-ToClipboard $Grid.GetClipboardContent() }
+        'Rows' {
+            $lines = @(($cols | ForEach-Object { $_.HeaderText }) -join "`t")
+            foreach ($i in (Get-SelectedRowIndexes $Grid)) {
+                $lines += (($cols | ForEach-Object { ([string]$Grid.Rows[$i].Cells[$_.Index].Value) -replace '[\t\r\n]+', ' ' }) -join "`t")
+            }
+            if ($lines.Count -gt 1) { Copy-ToClipboard ($lines -join "`r`n") }
+        }
+        'Column' {
+            if (-not $Grid.CurrentCell) { return }
+            $ci = $Grid.CurrentCell.ColumnIndex
+            Copy-ToClipboard ((@($Grid.Rows | ForEach-Object { [string]$_.Cells[$ci].Value }) -join "`r`n"))
+        }
+        'Hosts' {
+            $h = @(Get-SelectedHosts $Grid)
+            if ($h.Count -eq 0) { $h = @($Grid.Rows | ForEach-Object { [string]$_.Cells['Hostname'].Value } | Where-Object { $_ } | Select-Object -Unique) }
+            Copy-ToClipboard ($h -join "`r`n")
+        }
+    }
+}
+
+function Show-RowDetail {
+    # Panel 1: $script:Details, Panel 2: $script:ParserDetails (Hostname, yoksa SourceHost)
+    param($Grid, [int]$RowIndex)
+    if ($RowIndex -lt 0 -or $RowIndex -ge $Grid.Rows.Count) { return }
+    $rv = $Grid.Rows[$RowIndex].DataBoundItem
+    if (-not $rv) { return }
+    $hn = [string]$rv['Hostname']
+    $map = if ($Grid -eq $dgvParse) { $script:ParserDetails } else { $script:Details }
+    $txt = '(Detay yok)'
+    if ($map.ContainsKey($hn)) { $txt = $map[$hn] }
+    elseif ($Grid -eq $dgvParse -and $map.ContainsKey([string]$rv['SourceHost'])) { $txt = $map[[string]$rv['SourceHost']] }
+    Show-TextDialog -Title "Detay: $hn" -Text $txt
+}
+
+# Sag tik menusu (iki tablo icin tek menu; hangi tablodan acildigi SourceControl'den alinir)
+$script:GridMenu = New-Object System.Windows.Forms.ContextMenuStrip
+# Islem ogeleri (sadece Panel 1 / Panel 2 tablolarinda; panel mesgulken pasif). Hedef: secili satirlar.
+$script:GridOps = @()
+foreach ($mi in @(
+        @('Durumu Kontrol Et (secili satirlar)', { Start-GridCheck -Grid $script:GridMenu.SourceControl }),
+        @('Servisleri Baslat (secili satirlar)', { $g = $script:GridMenu.SourceControl; if ($g.SelectedCells.Count -gt 0) { Start-ServiceFix -Panel (Get-GridPanel $g) } }),
+        @('Istemci Onarimi - ccmrepair (secili satirlar)', { Start-GridRepair -Grid $script:GridMenu.SourceControl })
+    )) {
+    $item = New-Object System.Windows.Forms.ToolStripMenuItem ($mi[0])
+    $item.Font = New-Object System.Drawing.Font($item.Font, [System.Drawing.FontStyle]::Bold)
+    $item.Add_Click($mi[1])
+    [void]$script:GridMenu.Items.Add($item)
+    $script:GridOps += $item
+}
+$script:GridOpsSep = New-Object System.Windows.Forms.ToolStripSeparator
+[void]$script:GridMenu.Items.Add($script:GridOpsSep)
+$script:GridMenu.Add_Opening({
+    $g = $script:GridMenu.SourceControl
+    $main = ($g -eq $dgv -or $g -eq $dgvParse)
+    $busy = $main -and (Test-PanelBusy -Panel $(if ($g -eq $dgvParse) { 2 } else { 1 }))
+    foreach ($it in $script:GridOps) { $it.Visible = $main; $it.Enabled = -not $busy }
+    $script:GridOpsSep.Visible = $main
+})
+foreach ($mi in @(
+        @('Kopyala (Ctrl+C)', { Copy-GridData -Grid $script:GridMenu.SourceControl -Mode 'Cells' }),
+        @('Secili satirlari basliklariyla kopyala (Ctrl+Shift+C)', { Copy-GridData -Grid $script:GridMenu.SourceControl -Mode 'Rows' }),
+        @('Bu sutunu kopyala (gorunen tum satirlar)', { Copy-GridData -Grid $script:GridMenu.SourceControl -Mode 'Column' }),
+        @('Hostname listesini kopyala', { Copy-GridData -Grid $script:GridMenu.SourceControl -Mode 'Hosts' }),
+        @('-', $null),
+        @('Hucre degerini goster (kismi secip kopyalamak icin)', {
+            $g = $script:GridMenu.SourceControl
+            if ($g.CurrentCell) { Show-TextDialog -Title "$($g.Columns[$g.CurrentCell.ColumnIndex].HeaderText): $([string]$g.Rows[$g.CurrentCell.RowIndex].Cells['Hostname'].Value)" -Text ([string]$g.CurrentCell.Value) }
+        }),
+        @('Satir detayi (cift tik)', { $g = $script:GridMenu.SourceControl; if ($g.CurrentCell) { Show-RowDetail -Grid $g -RowIndex $g.CurrentCell.RowIndex } })
+    )) {
+    if ($mi[0] -eq '-') { [void]$script:GridMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)); continue }
+    $item = New-Object System.Windows.Forms.ToolStripMenuItem ($mi[0])
+    $item.Add_Click($mi[1])
+    [void]$script:GridMenu.Items.Add($item)
+}
+
+# ---------- Panel 1 sonuc tablosu ----------
+$dgv = New-ResultGrid
+$dgv.AutoSizeColumnsMode = 'Fill'
 $dgv.Columns.AddRange([System.Windows.Forms.DataGridViewColumn[]]@(
     (New-GridColumn 'Hostname'     'Hostname'              12),
     (New-GridColumn 'DnsStatus'    'DNS'                   13),
-    (New-GridColumn 'IsOnline'     'Online mi'              6),
+    (New-GridColumn 'IsOnline'     'Online mi'              8),
     (New-GridColumn 'AdStatus'     'AD Durumu'              8),
     (New-GridColumn 'LastLogon'    'AD Last Logon'         11),
     (New-GridColumn 'Running'      'Calisan Servisler'     10),
     (New-GridColumn 'NotRunning'   'Calismayan Servisler'  11),
     (New-GridColumn 'CcmExec'      'CcmExec'                7),
     (New-GridColumn 'LastAction'   'Son Islem'             13),
-    (New-GridColumn 'ActionResult' 'Islem Sonucu / Script Ciktisi'          30),
+    (New-GridColumn 'ActionResult' 'Islem Sonucu / Script Ciktisi' 30),
     (New-GridColumn 'ErrorMessage' 'Hata / Not'            14),
     (New-GridColumn 'State'        'State'                  5 $false)
 ))
@@ -2100,258 +3059,89 @@ $dgv.add_CellFormatting({
     $rowView = $dgv.Rows[$e.RowIndex].DataBoundItem
     if (-not $rowView) { return }
     switch ("$($rowView['State'])") {
-        'fail' { $e.CellStyle.BackColor = [System.Drawing.Color]::LightCoral }
-        'warn' { $e.CellStyle.BackColor = [System.Drawing.Color]::LightYellow }
-        'ok'   { $e.CellStyle.BackColor = [System.Drawing.Color]::LightGreen }
+        'fail'    { $e.CellStyle.BackColor = [System.Drawing.Color]::LightCoral }
+        'warn'    { $e.CellStyle.BackColor = [System.Drawing.Color]::LightYellow }
+        'ok'      { $e.CellStyle.BackColor = [System.Drawing.Color]::LightGreen }
         'pending' { $e.CellStyle.BackColor = [System.Drawing.Color]::Gainsboro }
     }
 })
 
-$dgv.add_CellDoubleClick({
-    param($sender, $e)
-    if ($e.RowIndex -lt 0) { return }
-    $h = [string]$dgv.Rows[$e.RowIndex].Cells['Hostname'].Value
-    $txt = if ($script:Details.ContainsKey($h)) { $script:Details[$h] } else { '(Detay yok)' }
-    Show-TextDialog -Title "Detay: $h" -Text $txt
-})
-
 # ==================== SEKMELER: PANEL 1 (Kontrol / Script Ciktilari)  +  PANEL 2 (Update Parser) ====================
 
-$tabs = New-Object System.Windows.Forms.TabControl
-$tabs.Location = New-Object System.Drawing.Point(220, 294)
-$tabs.Size = New-Object System.Drawing.Size(1110, 541)
-$tabs.Anchor = 'Top,Bottom,Left,Right'
+$tabs = New-Ctl TabControl '' 220 294 1110 541 @{ Anchor = 'Top,Bottom,Left,Right' }
 
-$tabOut = New-Object System.Windows.Forms.TabPage
-$tabOut.Text = 'Panel 1 - Script Ciktilari / Kontroller'
-$tabParse = New-Object System.Windows.Forms.TabPage
-$tabParse.Text = 'Panel 2 - Update Parser'
+$tabOut   = New-Ctl TabPage 'Panel 1 - Script Ciktilari / Kontroller'
+$tabParse = New-Ctl TabPage 'Panel 2 - Update Parser'
 
 # ---------- Panel 1 arac cubugu: filtre + Excel + CSV ----------
-$pnlTop1 = New-Object System.Windows.Forms.Panel
-$pnlTop1.Dock = 'Top'
-$pnlTop1.Height = 36
-
-$lblF1 = New-Object System.Windows.Forms.Label
-$lblF1.Text = 'Filtre:'
-$lblF1.Location = New-Object System.Drawing.Point(6, 11)
-$lblF1.AutoSize = $true
-
-$cboF1 = New-Object System.Windows.Forms.ComboBox
-$cboF1.DropDownStyle = 'DropDownList'
-$cboF1.Location = New-Object System.Drawing.Point(50, 7)
-$cboF1.Size = New-Object System.Drawing.Size(150, 23)
-
-$txtF1 = New-Object System.Windows.Forms.TextBox
-$txtF1.Location = New-Object System.Drawing.Point(206, 7)
-$txtF1.Size = New-Object System.Drawing.Size(200, 23)
-
-$btnClearF1 = New-Object System.Windows.Forms.Button
-$btnClearF1.Text = 'Temizle'
-$btnClearF1.Location = New-Object System.Drawing.Point(412, 5)
-$btnClearF1.Size = New-Object System.Drawing.Size(65, 27)
-
-$btnExcel1 = New-Object System.Windows.Forms.Button
-$btnExcel1.Text = "Excel'e Aktar"
-$btnExcel1.Location = New-Object System.Drawing.Point(490, 5)
-$btnExcel1.Size = New-Object System.Drawing.Size(110, 27)
-
-$btnCsv1 = New-Object System.Windows.Forms.Button
-$btnCsv1.Text = 'CSV'
-$btnCsv1.Location = New-Object System.Drawing.Point(606, 5)
-$btnCsv1.Size = New-Object System.Drawing.Size(70, 27)
-
-$lblCount1 = New-Object System.Windows.Forms.Label
-$lblCount1.Text = ''
-$lblCount1.Location = New-Object System.Drawing.Point(822, 11)
-$lblCount1.AutoSize = $true
-$lblCount1.ForeColor = [System.Drawing.Color]::DimGray
-
-$btnUnfocus1 = New-Object System.Windows.Forms.Button
-$btnUnfocus1.Text = 'Focus Kaybet'
-$btnUnfocus1.Location = New-Object System.Drawing.Point(688, 5)
-$btnUnfocus1.Size = New-Object System.Drawing.Size(124, 27)
-
+$pnlTop1     = New-Ctl Panel '' 0 0 0 0 @{ Dock = 'Top'; Height = 66 }
+$lblF1       = New-Ctl Label 'Filtre:' 6 11
+$cboF1       = New-Ctl ComboBox '' 50 7 150 23 @{ DropDownStyle = 'DropDownList' }
+$txtF1       = New-Ctl TextBox '' 206 7 200 23
+$btnClearF1  = New-Ctl Button 'Temizle' 412 5 65 27
+$btnExcel1   = New-Ctl Button "Excel'e Aktar" 490 5 110 27
+$btnCsv1     = New-Ctl Button 'CSV' 606 5 70 27
+$btnUnfocus1 = New-Ctl Button 'Focus Kaybet' 688 5 124 27
+$lblCount1   = New-Ctl Label '' 822 11 0 0 $gray
 $pnlTop1.Controls.AddRange(@($lblF1, $cboF1, $txtF1, $btnClearF1, $btnExcel1, $btnCsv1, $btnUnfocus1, $lblCount1))
+New-SummaryBar -Panel 1 -Parent $pnlTop1
 
 # ---------- Panel 2: Update Parser (Panel 1'den BAGIMSIZ) ----------
-$lblParserInfo = New-Object System.Windows.Forms.Label
-$lblParserInfo.Dock = 'Top'
-$lblParserInfo.Height = 24
-$lblParserInfo.TextAlign = 'MiddleLeft'
-$lblParserInfo.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-$lblParserInfo.ForeColor = [System.Drawing.Color]::DarkGreen
-$lblParserInfo.Text = "Update Parser (Panel 2 - Panel 1'den bagimsiz)  |  0 satir, 0 cihaz, 0 kolon uyumsuz / bilgi satiri"
-
-$lblParserStatus = New-Object System.Windows.Forms.Label
-$lblParserStatus.Dock = 'Top'
-$lblParserStatus.Height = 20
-$lblParserStatus.TextAlign = 'MiddleLeft'
-$lblParserStatus.ForeColor = [System.Drawing.Color]::DarkBlue
-$lblParserStatus.Text = ''
+$lblParserInfo = New-Ctl Label "Update Parser (Panel 2 - Panel 1'den bagimsiz)  |  0 satir, 0 cihaz, 0 kolon uyumsuz / bilgi satiri" 0 0 0 0 @{
+    AutoSize = $false; Dock = 'Top'; Height = 24; TextAlign = 'MiddleLeft'; ForeColor = [System.Drawing.Color]::DarkGreen
+    Font = (New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold))
+}
+$lblParserStatus = New-Ctl Label '' 0 0 0 0 @{ AutoSize = $false; Dock = 'Top'; Height = 20; TextAlign = 'MiddleLeft'; ForeColor = [System.Drawing.Color]::DarkBlue }
 
 # -- Yapistirma alani (eski client_update_parser.ps1 mantigi)
-$pnlPaste = New-Object System.Windows.Forms.Panel
-$pnlPaste.Dock = 'Top'
-$pnlPaste.Height = 100
-
-$lblPaste = New-Object System.Windows.Forms.Label
-$lblPaste.Text = "SCCM Run Script ciktisini yapistirin ('@' ile ayrilan her makine kaydi alt alta yazilir; her satir ';' ile ayrilmis):"
-$lblPaste.Dock = 'Top'
-$lblPaste.Height = 20
-$lblPaste.TextAlign = 'MiddleLeft'
-
-$txtParsePaste = New-Object System.Windows.Forms.TextBox
-$txtParsePaste.Multiline = $true
-$txtParsePaste.AcceptsReturn = $true
-$txtParsePaste.ScrollBars = 'Both'
-$txtParsePaste.WordWrap = $false
-$txtParsePaste.MaxLength = [int]::MaxValue
-$txtParsePaste.Font = New-Object System.Drawing.Font('Consolas', 9)
-$txtParsePaste.Dock = 'Fill'
-
-# Dock sirasi: Fill kontrol ILK, Top kontrol sonra eklenir
-$pnlPaste.Controls.AddRange(@($txtParsePaste, $lblPaste))
+$pnlPaste = New-Ctl Panel '' 0 0 0 0 @{ Dock = 'Top'; Height = 100 }
+$lblPaste = New-Ctl Label "SCCM Run Script ciktisini yapistirin ('@' ile ayrilan her makine kaydi alt alta yazilir; her satir ';' ile ayrilmis):" 0 0 0 0 @{ AutoSize = $false; Dock = 'Top'; Height = 20; TextAlign = 'MiddleLeft' }
+$txtParsePaste = New-Ctl TextBox '' 0 0 0 0 @{
+    Multiline = $true; AcceptsReturn = $true; ScrollBars = 'Both'; WordWrap = $false; MaxLength = [int]::MaxValue
+    Font = (New-Object System.Drawing.Font('Consolas', 9)); Dock = 'Fill'
+}
+$pnlPaste.Controls.AddRange(@($txtParsePaste, $lblPaste))   # Dock sirasi: Fill kontrol ILK, Top kontrol sonra
 
 # -- Calistirma cubugu
-$pnlRun2 = New-Object System.Windows.Forms.Panel
-$pnlRun2.Dock = 'Top'
-$pnlRun2.Height = 36
-
-$btnParseRun = New-Object System.Windows.Forms.Button
-$btnParseRun.Text = 'Parse Et'
-$btnParseRun.Location = New-Object System.Drawing.Point(6, 5)
-$btnParseRun.Size = New-Object System.Drawing.Size(100, 27)
-
-$chkParseCheck = New-Object System.Windows.Forms.CheckBox
-$chkParseCheck.Text = 'DNS / AD / SCCM ajan kontrolu ekle'
-$chkParseCheck.Location = New-Object System.Drawing.Point(114, 9)
-$chkParseCheck.AutoSize = $true
-$chkParseCheck.Checked = $true
-
-$chkParseAppend = New-Object System.Windows.Forms.CheckBox
-$chkParseAppend.Text = 'Tabloya ekle'
-$chkParseAppend.Location = New-Object System.Drawing.Point(376, 9)
-$chkParseAppend.AutoSize = $true
-
-$btnParseScript = New-Object System.Windows.Forms.Button
-$btnParseScript.Text = 'Script Gonder (Panel 2)'
-$btnParseScript.Location = New-Object System.Drawing.Point(486, 5)
-$btnParseScript.Size = New-Object System.Drawing.Size(180, 27)
-$btnParseScript.Enabled = $false
-
-$btnParseRecheck = New-Object System.Windows.Forms.Button
-$btnParseRecheck.Text = 'Kontrolleri Calistir'
-$btnParseRecheck.Location = New-Object System.Drawing.Point(674, 5)
-$btnParseRecheck.Size = New-Object System.Drawing.Size(150, 27)
-
-$btnParseClear = New-Object System.Windows.Forms.Button
-$btnParseClear.Text = 'Parser Temizle'
-$btnParseClear.Location = New-Object System.Drawing.Point(832, 5)
-$btnParseClear.Size = New-Object System.Drawing.Size(105, 27)
-
-$pnlRun2.Controls.AddRange(@($btnParseRun, $chkParseCheck, $chkParseAppend, $btnParseScript, $btnParseRecheck, $btnParseClear))
-
-$tip = New-Object System.Windows.Forms.ToolTip
-$tip.SetToolTip($chkParseAppend, 'Isaretli degilse "Parse Et" mevcut tabloyu temizleyip yeni veriyi yazar (eski parser gibi).')
-$tip.SetToolTip($btnParseScript, 'Ustteki 2) SCCM Script bolumundeki script secimini kullanir. Hedef: bu tabloda secili satirlar; yoksa soldaki liste. Sonuc SADECE Panel 2''ye yazilir.')
-$tip.SetToolTip($btnParseRecheck, 'Tabloda secili satirlarin (yoksa tum cihazlarin) DNS / AD / SCCM ajan kontrolunu yeniden calistirir.')
+$pnlRun2         = New-Ctl Panel '' 0 0 0 0 @{ Dock = 'Top'; Height = 36 }
+$btnParseRun     = New-Ctl Button 'Parse Et' 6 5 100 27
+$chkParseCheck   = New-Ctl CheckBox 'DNS / AD / servis / SCCM ajan kontrolu ekle' 114 9 0 0 @{ Checked = $true }
+$chkParseAppend  = New-Ctl CheckBox 'Tabloya ekle' 398 9
+$btnParseScript  = New-Ctl Button 'Script Gonder (Panel 2)' 500 5 165 27 @{ Enabled = $false }
+$btnParseRecheck = New-Ctl Button 'Kontrolleri Calistir' 670 5 132 27
+$btnParseFix     = New-Ctl Button 'Servisleri Baslat' 807 5 120 27 @{ Enabled = $false }
+$btnParseCancel  = New-Ctl Button 'Iptal Et' 932 5 70 27 @{ Enabled = $false }
+$btnParseClear   = New-Ctl Button 'Temizle' 1007 5 75 27
+$pnlRun2.Controls.AddRange(@($btnParseRun, $chkParseCheck, $chkParseAppend, $btnParseScript, $btnParseRecheck, $btnParseFix, $btnParseCancel, $btnParseClear))
 
 # -- Filtre cubugu
-$pnlTop2 = New-Object System.Windows.Forms.Panel
-$pnlTop2.Dock = 'Top'
-$pnlTop2.Height = 36
-
-$lblF2 = New-Object System.Windows.Forms.Label
-$lblF2.Text = 'Filtre:'
-$lblF2.Location = New-Object System.Drawing.Point(6, 11)
-$lblF2.AutoSize = $true
-
-$cboF2 = New-Object System.Windows.Forms.ComboBox
-$cboF2.DropDownStyle = 'DropDownList'
-$cboF2.Location = New-Object System.Drawing.Point(50, 7)
-$cboF2.Size = New-Object System.Drawing.Size(200, 23)
-
-$txtF2 = New-Object System.Windows.Forms.TextBox
-$txtF2.Location = New-Object System.Drawing.Point(256, 7)
-$txtF2.Size = New-Object System.Drawing.Size(200, 23)
-
-$btnClearF2 = New-Object System.Windows.Forms.Button
-$btnClearF2.Text = 'Temizle'
-$btnClearF2.Location = New-Object System.Drawing.Point(462, 5)
-$btnClearF2.Size = New-Object System.Drawing.Size(65, 27)
-
-$lblCount2 = New-Object System.Windows.Forms.Label
-$lblCount2.Text = ''
-$lblCount2.Location = New-Object System.Drawing.Point(676, 11)
-$lblCount2.AutoSize = $true
-$lblCount2.ForeColor = [System.Drawing.Color]::DimGray
-
-$btnUnfocus2 = New-Object System.Windows.Forms.Button
-$btnUnfocus2.Text = 'Focus Kaybet'
-$btnUnfocus2.Location = New-Object System.Drawing.Point(534, 5)
-$btnUnfocus2.Size = New-Object System.Drawing.Size(124, 27)
-
+$pnlTop2     = New-Ctl Panel '' 0 0 0 0 @{ Dock = 'Top'; Height = 66 }
+$lblF2       = New-Ctl Label 'Filtre:' 6 11
+$cboF2       = New-Ctl ComboBox '' 50 7 200 23 @{ DropDownStyle = 'DropDownList' }
+$txtF2       = New-Ctl TextBox '' 256 7 200 23
+$btnClearF2  = New-Ctl Button 'Temizle' 462 5 65 27
+$btnUnfocus2 = New-Ctl Button 'Focus Kaybet' 534 5 124 27
+$lblCount2   = New-Ctl Label '' 676 11 0 0 $gray
 $pnlTop2.Controls.AddRange(@($lblF2, $cboF2, $txtF2, $btnClearF2, $btnUnfocus2, $lblCount2))
+New-SummaryBar -Panel 2 -Parent $pnlTop2
 
-# -- Kayit cubugu (eski parser: kayit klasoru + Gozat + CSV Olustur ve Ac)
-$pnlSave2 = New-Object System.Windows.Forms.Panel
-$pnlSave2.Dock = 'Bottom'
-$pnlSave2.Height = 36
-
-$lblPath2 = New-Object System.Windows.Forms.Label
-$lblPath2.Text = 'Kayit klasoru:'
-$lblPath2.Location = New-Object System.Drawing.Point(6, 11)
-$lblPath2.AutoSize = $true
-
-$txtPath2 = New-Object System.Windows.Forms.TextBox
-$txtPath2.Text = $script:ParserDefaultFolder
-$txtPath2.Location = New-Object System.Drawing.Point(92, 7)
-$txtPath2.Size = New-Object System.Drawing.Size(380, 23)
-
-$btnBrowse2 = New-Object System.Windows.Forms.Button
-$btnBrowse2.Text = 'Gozat...'
-$btnBrowse2.Location = New-Object System.Drawing.Point(480, 5)
-$btnBrowse2.Size = New-Object System.Drawing.Size(70, 27)
-
-$btnExcel2 = New-Object System.Windows.Forms.Button
-$btnExcel2.Text = "Excel'e Aktar"
-$btnExcel2.Location = New-Object System.Drawing.Point(558, 5)
-$btnExcel2.Size = New-Object System.Drawing.Size(110, 27)
-
-$btnCsv2 = New-Object System.Windows.Forms.Button
-$btnCsv2.Text = 'CSV Olustur ve Ac'
-$btnCsv2.Location = New-Object System.Drawing.Point(676, 5)
-$btnCsv2.Size = New-Object System.Drawing.Size(140, 27)
-
+# -- Kayit cubugu (kayit klasoru + Gozat + Excel + CSV Olustur ve Ac)
+$pnlSave2   = New-Ctl Panel '' 0 0 0 0 @{ Dock = 'Bottom'; Height = 36 }
+$lblPath2   = New-Ctl Label 'Kayit klasoru:' 6 11
+$txtPath2   = New-Ctl TextBox $script:ParserDefaultFolder 92 7 380 23
+$btnBrowse2 = New-Ctl Button 'Gozat...' 480 5 70 27
+$btnExcel2  = New-Ctl Button "Excel'e Aktar" 558 5 110 27
+$btnCsv2    = New-Ctl Button 'CSV Olustur ve Ac' 676 5 140 27
 $pnlSave2.Controls.AddRange(@($lblPath2, $txtPath2, $btnBrowse2, $btnExcel2, $btnCsv2))
 
-$dgvParse = New-Object System.Windows.Forms.DataGridView
-$dgvParse.Dock = 'Fill'
-$dgvParse.ReadOnly = $true
-$dgvParse.AllowUserToAddRows = $false
-$dgvParse.AllowUserToDeleteRows = $false
-$dgvParse.RowHeadersVisible = $false
-$dgvParse.SelectionMode = 'FullRowSelect'
-$dgvParse.MultiSelect = $true
-$dgvParse.ClipboardCopyMode = 'EnableAlwaysIncludeHeaderText'
-$dgvParse.AutoGenerateColumns = $false
+$dgvParse = New-ResultGrid
 $dgvParse.AutoSizeColumnsMode = 'None'
-
-foreach ($cn in $script:ParserColumns) {
-    $col = New-GridColumn $cn $cn 10
-    $col.Width = $(if ($cn -eq 'UpdateName') { 300 } else { 130 })
-    [void]$dgvParse.Columns.Add($col)
-}
-foreach ($cn in $script:ParserCheckColumns) {
-    $col = New-GridColumn $cn $cn 10
-    $col.Width = $(if ($cn -eq 'SCCM_Kayit') { 200 } elseif ($cn -eq 'DNS_Durumu') { 150 } elseif ($cn -eq 'AD_LastLogon') { 130 } else { 120 })
-    [void]$dgvParse.Columns.Add($col)
-}
-$colUy = New-GridColumn 'KolonUyumu' 'KolonUyumu' 10
-$colUy.Width = 170
-[void]$dgvParse.Columns.Add($colUy)
+foreach ($cn in $script:ParserColumns) { [void]$dgvParse.Columns.Add((New-GridColumn $cn $cn 10 $true $(if ($cn -eq 'UpdateName') { 300 } else { 130 }))) }
+$w2 = @{ SCCM_Kayit = 200; DNS_Durumu = 150; AD_LastLogon = 130; Calisan_Servisler = 180; Calismayan_Servisler = 200 }
+foreach ($cn in $script:ParserCheckColumns) { [void]$dgvParse.Columns.Add((New-GridColumn $cn $cn 10 $true $(if ($w2.ContainsKey($cn)) { $w2[$cn] } else { 120 }))) }
+[void]$dgvParse.Columns.Add((New-GridColumn 'KolonUyumu' 'KolonUyumu' 10 $true 170))
 [void]$dgvParse.Columns.Add((New-GridColumn 'SourceHost' 'SourceHost' 10 $false))
+[void]$dgvParse.Columns.Add((New-GridColumn 'Durum' 'Durum' 10 $false))
 $dgvParse.DataSource = $script:ParseBinding
 
 $dgvParse.add_CellFormatting({
@@ -2368,45 +3158,61 @@ $dgvParse.add_CellFormatting({
 
     if ("$($rowView['KolonUyumu'])" -notlike 'OK*') { $e.CellStyle.BackColor = $yel }
 
-    if ($cn -eq 'DNS_Durumu') {
-        if ($v -like 'No such host*' -or $v -like 'DNS hatasi*' -or $v -like 'Islem hatasi*') { $e.CellStyle.BackColor = $red }
-        elseif ($v -and $v -notlike 'Kontrol ediliyor*' -and $v -notlike 'Bekleniyor*') { $e.CellStyle.BackColor = $grn }
+    switch ($cn) {
+        'DNS_Durumu' {
+            if ($v -like 'No such host*' -or $v -like 'DNS hatasi*' -or $v -like 'Islem hatasi*' -or $v -eq 'Iptal edildi') { $e.CellStyle.BackColor = $red }
+            elseif ($v -and $v -notlike 'Bekleniyor*') { $e.CellStyle.BackColor = $grn }
+        }
+        'Online_mi' {
+            if ($v -eq 'Evet') { $e.CellStyle.BackColor = $grn }
+            elseif ($v -like 'Hayir*') { $e.CellStyle.BackColor = $red }
+            elseif ($v) { $e.CellStyle.BackColor = $yel }
+        }
+        'AD_Durumu' {
+            if ($v -eq 'Enabled') { $e.CellStyle.BackColor = $grn }
+            elseif ($v -eq 'Disabled' -or $v -eq 'Bulunamadi') { $e.CellStyle.BackColor = $red }
+            elseif ($v) { $e.CellStyle.BackColor = $yel }
+        }
+        'Calismayan_Servisler' {
+            if ($v -and $v -notlike 'Kontrol edilemedi*' -and $v -notlike 'Bekleniyor*') { $e.CellStyle.BackColor = $red }
+        }
+        'CcmExec_Durumu' {
+            if ($v -eq 'Running') { $e.CellStyle.BackColor = $grn }
+            elseif ($v -eq 'Yok') { $e.CellStyle.BackColor = $red }
+            elseif ($v) { $e.CellStyle.BackColor = $yel }
+        }
+        'SCCM_Kayit' {
+            if ($v -like 'Client yuklu*') { $e.CellStyle.BackColor = $grn }
+            elseif ($v -like 'SCCM de kayitli degil*' -or $v -like 'Kayit var*') { $e.CellStyle.BackColor = $red }
+            elseif ($v) { $e.CellStyle.BackColor = $yel }
+        }
     }
-    elseif ($cn -eq 'Online_mi') {
-        if ($v -eq 'Evet') { $e.CellStyle.BackColor = $grn }
-        elseif ($v -eq 'Hayir') { $e.CellStyle.BackColor = $red }
-    }
-    elseif ($cn -eq 'AD_Durumu') {
-        if ($v -eq 'Enabled') { $e.CellStyle.BackColor = $grn }
-        elseif ($v -eq 'Disabled' -or $v -eq 'Bulunamadi') { $e.CellStyle.BackColor = $red }
-        elseif ($v) { $e.CellStyle.BackColor = $yel }
-    }
-    elseif ($cn -eq 'CcmExec_Durumu') {
-        if ($v -eq 'Running') { $e.CellStyle.BackColor = $grn }
-        elseif ($v -eq 'Yok') { $e.CellStyle.BackColor = $red }
-        elseif ($v) { $e.CellStyle.BackColor = $yel }
-    }
-    elseif ($cn -eq 'SCCM_Kayit') {
-        if ($v -like 'Client yuklu*') { $e.CellStyle.BackColor = $grn }
-        elseif ($v -like 'SCCM de kayitli degil*' -or $v -like 'Kayit var*') { $e.CellStyle.BackColor = $red }
-        elseif ($v) { $e.CellStyle.BackColor = $yel }
-    }
-
     if ($v -like 'Bekleniyor*') { $e.CellStyle.BackColor = [System.Drawing.Color]::Gainsboro }
 })
 
-$dgvParse.add_CellDoubleClick({
-    param($sender, $e)
-    if ($e.RowIndex -lt 0) { return }
-    $rv = $dgvParse.Rows[$e.RowIndex].DataBoundItem
-    if (-not $rv) { return }
-    $hn = [string]$rv['Hostname']
-    $sh = [string]$rv['SourceHost']
-    $txt = '(Detay yok)'
-    if ($script:ParserDetails.ContainsKey($hn))     { $txt = $script:ParserDetails[$hn] }
-    elseif ($script:ParserDetails.ContainsKey($sh)) { $txt = $script:ParserDetails[$sh] }
-    Show-TextDialog -Title "Detay: $hn" -Text $txt
-})
+# Iki tablo icin ortak olaylar: cift tik = detay, sag tik = hucreyi sec + menu, Ctrl+Shift+C = satirlari basliklariyla kopyala,
+# Esc / bos alana tik = secimi birak (hedef tekrar soldaki liste olur)
+foreach ($g in @($dgv, $dgvParse)) {
+    $g.add_CellDoubleClick({ param($s, $e) if ($e.RowIndex -ge 0) { Show-RowDetail -Grid $s -RowIndex $e.RowIndex } })
+    $g.add_CellMouseDown({
+        param($s, $e)
+        if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Right -or $e.RowIndex -lt 0 -or $e.ColumnIndex -lt 0) { return }
+        $cell = $s.Rows[$e.RowIndex].Cells[$e.ColumnIndex]
+        if (-not $cell.Selected) { $s.ClearSelection(); $cell.Selected = $true }
+        $s.CurrentCell = $cell
+    })
+    $g.Add_MouseDown({
+        param($s, $e)
+        if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+        if ($s.HitTest($e.X, $e.Y).Type -eq [System.Windows.Forms.DataGridViewHitTestType]::None) { Clear-GridFocus -Grid $s }
+    })
+    $g.Add_KeyDown({
+        param($s, $e)
+        if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { Clear-GridFocus -Grid $s; $e.Handled = $true }
+        elseif ($e.Control -and $e.Shift -and $e.KeyCode -eq [System.Windows.Forms.Keys]::C) { Copy-GridData -Grid $s -Mode 'Rows'; $e.Handled = $true }
+    })
+}
+
 # Dock sirasi: Fill kontrol ILK eklenir, Top kontroller sonra (en son eklenen en ustte durur)
 $tabOut.Controls.AddRange(@($dgv, $pnlTop1))
 $tabParse.Controls.AddRange(@($dgvParse, $pnlSave2, $pnlTop2, $pnlRun2, $pnlPaste, $lblParserStatus, $lblParserInfo))
@@ -2416,14 +3222,32 @@ $tabParse.Controls.AddRange(@($dgvParse, $pnlSave2, $pnlTop2, $pnlRun2, $pnlPast
 # Filtre kolon listeleri
 $script:ColMap1 = Get-ColumnMap -Grid $dgv
 $script:ColMap2 = Get-ColumnMap -Grid $dgvParse
-[void]$cboF1.Items.Add($script:AllColsLabel)
-foreach ($k in $script:ColMap1.Keys) { [void]$cboF1.Items.Add($k) }
-$cboF1.SelectedIndex = 0
-[void]$cboF2.Items.Add($script:AllColsLabel)
-foreach ($k in $script:ColMap2.Keys) { [void]$cboF2.Items.Add($k) }
-$cboF2.SelectedIndex = 0
+foreach ($p in @(@($cboF1, $script:ColMap1), @($cboF2, $script:ColMap2))) {
+    [void]$p[0].Items.Add($script:AllColsLabel)
+    foreach ($k in $p[1].Keys) { [void]$p[0].Items.Add($k) }
+    $p[0].SelectedIndex = 0
+}
 
-$form.Controls.AddRange(@($lblComputers, $txtComputers, $gbCheck, $gbSccm, $gbActions, $lblStatus, $tabs))
+$form.Controls.AddRange(@($lblComputers, $txtComputers, $gbCheck, $gbSccm, $gbActions, $btnCancel1, $lblStatus, $tabs))
+
+$tip = New-Object System.Windows.Forms.ToolTip
+$tip.SetToolTip($chkParseAppend, 'Isaretli degilse "Parse Et" mevcut tabloyu temizleyip yeni veriyi yazar (eski parser gibi).')
+$tip.SetToolTip($btnParseScript, 'Ustteki 2) SCCM Script bolumundeki script secimini kullanir. Hedef: bu tabloda secili satirlar; yoksa soldaki liste. Sonuc SADECE Panel 2''ye yazilir.')
+$tip.SetToolTip($btnParseRecheck, 'Tabloda secili satirlarin (yoksa tum cihazlarin) DNS / AD / servis / SCCM ajan kontrolunu yeniden calistirir. Servis listesi: 1) Kontrol bolumu.')
+$tip.SetToolTip($btnAdCache, "Domain / OU eslemesini girdiginiz pencereyi acar; eslesen OU'lardaki bilgisayar hesaplarini AD'den okuyup diskteki CSV onbellegini olusturur. Kontroller AD'ye degil bu onbellege bakar; onbellek sadece kullanici isterse guncellenir.")
+$tip.SetToolTip($btnUnfocus1, 'Tablodaki secimi ve aktif hucreyi kaldirir; hedef tekrar soldaki liste olur. (Tablonun bos alanina tiklamak veya Esc de ayni isi yapar.)')
+$tip.SetToolTip($btnUnfocus2, 'Tablodaki secimi ve aktif hucreyi kaldirir; hedef tekrar soldaki liste olur. (Tablonun bos alanina tiklamak veya Esc de ayni isi yapar.)')
+$tip.SetToolTip($btnParseFix, 'Son kontrolde durdurulmus servisi olan cevrimici cihazlarda servisleri baslatir. Tabloda secim varsa sadece secili cihazlar. Sonuc SADECE Panel 2''ye yazilir.')
+$tip.SetToolTip($btnFix, 'Son kontrolde durdurulmus servisi olan cevrimici cihazlarda servisleri baslatir. Tabloda secim varsa sadece secili cihazlar.')
+$tip.SetToolTip($btnCancel1, 'Panel 1''de bekleyen / calisan isleri durdurur. Tamamlanan sonuclar korunur; SCCM''e gonderilmis script / eylemler geri alinamaz.')
+$tip.SetToolTip($btnParseCancel, 'Panel 2''de bekleyen / calisan isleri durdurur. Tamamlanan sonuclar korunur; SCCM''e gonderilmis scriptler geri alinamaz.')
+$tip.SetToolTip($btnLog, "ClientTool_yyyyMM.log denetim kaydini (kim, ne zaman, hangi cihaza, hangi islem, sonuc) filtrelenebilir tabloda acar.")
+foreach ($p in 1, 2) {
+    $tip.SetToolTip($script:RetryButtons[$p], 'Bu paneldeki SON islemi, sonucu Hata (kirmizi) olan cihazlar icin ayni ayarlarla yeniden calistirir (iptal edilenler dahil).')
+    $tip.SetToolTip($script:Auto[$p].Check, $(if ($p -eq 1) { 'Secilen araliklarla tablodaki tum cihazlar icin Kontrol (DNS / Online / AD / servis) tekrarlanir. Tablo silinmez.' } else { 'Secilen araliklarla tablodaki tum cihazlar icin DNS / AD / servis / SCCM kontrolu tekrarlanir. Script tekrar GONDERILMEZ.' }))
+    foreach ($k in 'ok', 'warn', 'fail', 'pending', 'all') { $tip.SetToolTip($script:SumButtons[$p][$k], 'Tikla: tabloyu bu duruma filtrele (tekrar tikla / Tumu: filtreyi kaldir). Metin filtresiyle birlikte calisir.') }
+}
+$tip.SetToolTip($btnCheck, "Online mi: Evet = ping + cihaz adi dogrulandi | Hayir (IP baska cihazda) = DNS kaydi eski, IP'yi baska cihaz kullaniyor | Hayir (ping var, cihaz dogrulanamadi) = cevap veren cihazin adi okunamadi (gateway / joker DNS olabilir).")
 
 # ==================== UI DURUM YONETIMI ====================
 
@@ -2431,7 +3255,7 @@ function Update-ButtonStates {
     $busy1 = Test-PanelBusy -Panel 1
     $busy2 = Test-PanelBusy -Panel 2
 
-    $btnFix.Enabled = ((@($script:LastResults | Where-Object { $_.IsOnline }).Count -gt 0) -and -not $busy1)
+    $btnFix.Enabled = ((@($script:LastResults.Values | Where-Object { $_.IsOnline }).Count -gt 0) -and -not $busy1)
 
     $idx = $cboScripts.SelectedIndex
     $ok = $false
@@ -2440,6 +3264,7 @@ function Update-ButtonStates {
     }
     $btnSendScript.Enabled  = ($ok -and -not $busy1)     # Panel 1
     $btnParseScript.Enabled = ($ok -and -not $busy2)     # Panel 2
+    $btnParseFix.Enabled = ((@($script:ParserSvc.Values | Where-Object { $_.IsOnline }).Count -gt 0) -and -not $busy2)
     $btnShowScript.Enabled = ($script:SiteCode -and $idx -ge 0)
 }
 
@@ -2448,11 +3273,15 @@ function Set-UiBusy {
     param([bool]$Busy, [int]$Panel = 1)
 
     if ($Panel -eq 2) {
-        foreach ($b in @($btnParseRun, $btnParseScript, $btnParseRecheck)) { $b.Enabled = -not $Busy }
+        foreach ($b in @($btnParseRun, $btnParseScript, $btnParseRecheck, $btnParseFix)) { $b.Enabled = -not $Busy }
+        $btnParseCancel.Enabled = $Busy
     }
     else {
-        foreach ($b in @($btnCheck, $btnAd, $btnFix, $btnAction, $btnSendScript, $btnConnect, $btnShowScript)) { $b.Enabled = -not $Busy }
+        foreach ($b in @($btnCheck, $btnAd, $btnFix, $btnAction, $btnSendScript, $btnConnect, $btnShowScript, $btnAdCache)) { $b.Enabled = -not $Busy }
+        $btnCancel1.Enabled = $Busy
     }
+    if ($script:RetryButtons[$Panel] -and $Busy) { $script:RetryButtons[$Panel].Enabled = $false }
+    $script:SumDirty[$Panel] = $true
     if (-not $Busy) { Update-ButtonStates }
 }
 # ==================== AYARLAR ====================
@@ -2468,13 +3297,18 @@ function Import-Settings {
             $t = [int]$s.Timeout
             if ($t -ge $nudTimeout.Minimum -and $t -le $nudTimeout.Maximum) { $nudTimeout.Value = $t }
         }
-        if ($null -ne $s.AllDCs) { $chkAllDc.Checked = [bool]$s.AllDCs }
         if ($s.ParserFolder) { $txtPath2.Text = [string]$s.ParserFolder }
         if ($null -ne $s.ParserCheck) { $chkParseCheck.Checked = [bool]$s.ParserCheck }
         if ($s.LastScriptGuid) { $script:PendingScriptGuid = [string]$s.LastScriptGuid }
+        if ($null -ne $s.AdCacheSources) {   # AD onbellegi domain / OU eslemesi
+            $script:AdCacheSources = @($s.AdCacheSources | Where-Object { $_ -and $_.Domain -and $_.OU } |
+                ForEach-Object { [pscustomobject]@{ Domain = [string]$_.Domain; OU = [string]$_.OU } })
+        }
     }
     catch { }
 }
+
+function Get-ServiceList { return @($txtServices.Text -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
 
 function Save-Settings {
     try {
@@ -2486,12 +3320,12 @@ function Save-Settings {
             SmsServer      = $txtSms.Text.Trim()
             Services       = $txtServices.Text.Trim()
             Timeout        = [int]$nudTimeout.Value
-            AllDCs         = [bool]$chkAllDc.Checked
             ParserFolder   = $txtPath2.Text.Trim()
             ParserCheck    = [bool]$chkParseCheck.Checked
             LastScriptGuid = $guid
+            AdCacheSources = @($script:AdCacheSources | ForEach-Object { [pscustomobject]@{ Domain = [string]$_.Domain; OU = [string]$_.OU } })
         }
-        Set-Content -Path (Get-SettingsFile) -Value ($obj | ConvertTo-Json) -Encoding UTF8
+        Set-Content -Path (Get-SettingsFile) -Value ($obj | ConvertTo-Json -Depth 4) -Encoding UTF8
     }
     catch { }
 }
@@ -2499,75 +3333,64 @@ function Save-Settings {
 # ==================== OLAY YONETICILERI ====================
 
 # ---------- Filtreler (Panel 1 ve Panel 2) ----------
-$txtF1.Add_TextChanged({ Set-GridFilter -Source $script:BindingSrc -ColMap $script:ColMap1 -ColumnHeader ([string]$cboF1.SelectedItem) -Text $txtF1.Text })
-$cboF1.Add_SelectedIndexChanged({ Set-GridFilter -Source $script:BindingSrc -ColMap $script:ColMap1 -ColumnHeader ([string]$cboF1.SelectedItem) -Text $txtF1.Text })
+$txtF1.Add_TextChanged({ Update-Filter -Panel 1 })
+$cboF1.Add_SelectedIndexChanged({ Update-Filter -Panel 1 })
 $btnClearF1.Add_Click({ $txtF1.Text = ''; $cboF1.SelectedIndex = 0 })
 
-$txtF2.Add_TextChanged({ Set-GridFilter -Source $script:ParseBinding -ColMap $script:ColMap2 -ColumnHeader ([string]$cboF2.SelectedItem) -Text $txtF2.Text })
-$cboF2.Add_SelectedIndexChanged({ Set-GridFilter -Source $script:ParseBinding -ColMap $script:ColMap2 -ColumnHeader ([string]$cboF2.SelectedItem) -Text $txtF2.Text })
+$txtF2.Add_TextChanged({ Update-Filter -Panel 2 })
+$cboF2.Add_SelectedIndexChanged({ Update-Filter -Panel 2 })
 $btnClearF2.Add_Click({ $txtF2.Text = ''; $cboF2.SelectedIndex = 0 })
 
 # Gosterilen / toplam satir sayaci (filtre uygulaninca ilk deger kuculur)
 $script:BindingSrc.Add_ListChanged({ $lblCount1.Text = "Satir: $($script:BindingSrc.Count) / $($script:ResultsTable.Rows.Count)" })
 $script:ParseBinding.Add_ListChanged({ $lblCount2.Text = "Satir: $($script:ParseBinding.Count) / $($script:ParseTable.Rows.Count)" })
 
+# V7: ozet sayaclari - tablo degisince kirli isaretlenir, SummaryTimer en fazla 0,5 sn'de bir gunceller (UI'yi yormaz)
+$script:ResultsTable.Add_RowChanged({ $script:SumDirty[1] = $true })
+$script:ResultsTable.Add_RowDeleted({ $script:SumDirty[1] = $true })
+$script:ResultsTable.Add_TableCleared({ $script:SumDirty[1] = $true })
+$script:ParseTable.Add_RowChanged({ param($s, $e) [void]$script:DirtyRows.Add($e.Row); $script:SumDirty[2] = $true })
+$script:ParseTable.Add_RowDeleted({ $script:SumDirty[2] = $true })
+$script:ParseTable.Add_TableCleared({ $script:DirtyRows.Clear(); $script:SumDirty[2] = $true })
+$script:SummaryTimer = New-Object System.Windows.Forms.Timer
+$script:SummaryTimer.Interval = 500
+$script:SummaryTimer.Add_Tick({ foreach ($p in 1, 2) { if ($script:SumDirty[$p]) { Update-SummaryNow -Panel $p } } })
+$script:SummaryTimer.Start()
+
+# V13: otomatik yenileme zamanlayicisi
+$script:AutoTimer = New-Object System.Windows.Forms.Timer
+$script:AutoTimer.Interval = 15000
+$script:AutoTimer.Add_Tick({ Invoke-AutoRefresh })
+$script:AutoTimer.Start()
+
+# V14: islem kaydi goruntuleyici
+$btnLog.Add_Click({ Show-LogViewer })
+
 # ---------- Kontrol Et ----------
 $btnCheck.Add_Click({
     $computers = @(Get-ComputerList)
     if ($computers.Count -eq 0) { return }
-
-    $services = @($txtServices.Text -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $services = @(Get-ServiceList)
     if ($services.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show('En az bir servis ismi girin.', 'Uyari') | Out-Null
         return
     }
-
-    $script:ResultsTable.Rows.Clear()
-    $script:LastResults = @()
-    $script:Details.Clear()
-
-    $allDc = [bool]$chkAllDc.Checked
-    $items = @(foreach ($h in $computers) {
-        [pscustomobject]@{ Key = $h; Params = @{ ComputerName = $h; ServiceNames = $services; QueryAllDCs = $allDc } }
-    })
-    Set-GridPending -Hosts $computers -ClearError -Columns @('DnsStatus', 'IsOnline', 'AdStatus', 'LastLogon', 'Running', 'NotRunning', 'CcmExec')
-    # Tablo bastan olustu: otomatik secilen ilk satir sonraki islemlerin hedefini daraltmasin
-    try { $dgv.ClearSelection(); $dgv.CurrentCell = $null } catch { }
-    Start-ParallelRun -Title 'Kontrol' -Worker $script:CheckWorker -Items $items -OnResultFn 'Update-GridFromCheck'
+    Start-Check -Hosts $computers -Services $services -Reset
 })
 
 # ---------- Servisleri Baslat ----------
-$btnFix.Add_Click({
-    $targets = @($script:LastResults | Where-Object {
-        $_.IsOnline -and $_.ServiceDetail -and
-        (@($_.ServiceDetail | Where-Object { $_.Status -ne 'Running' -and $_.Status -ne 'NotFound' -and $_.Status -ne 'Erisilemedi' })).Count -gt 0
-    })
+$btnFix.Add_Click({ Start-ServiceFix -Panel 1 })
 
-    if ($targets.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show('Baslatilacak bir servis bulunamadi (hepsi calisiyor / bulunamadi / erisilemedi).', 'Bilgi') | Out-Null
-        return
-    }
-
-    $confirm = [System.Windows.Forms.MessageBox]::Show(
-        "$($targets.Count) makinede durdurulmus servisler bulundu. Baslatilsin mi? (Ayni anda en fazla $($script:MaxParallel) makine islenir)",
-        'Onay', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
-    if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-
-    $items = @(foreach ($t in $targets) {
-        [pscustomobject]@{ Key = $t.Hostname; Params = @{ ComputerName = $t.Hostname; ServiceDetail = $t.ServiceDetail } }
-    })
-    Set-GridPending -Hosts @($targets | ForEach-Object { $_.Hostname }) -Columns @('ActionResult')
-    Start-ParallelRun -Title 'Servis baslatma' -Worker $script:FixWorker -Items $items -OnResultFn 'Update-GridFromFix'
-})
+# ---------- AD Onbellegi: domain / OU eslemesi penceresi (guncelleme sadece kullanici isterse) ----------
+$btnAdCache.Add_Click({ Show-AdCacheDialog })
 
 # ---------- AD Yapisi Kontrolu (script gondermeden; DNS + ping + AD) ----------
 $btnAd.Add_Click({
     $t = Get-TargetHosts -Grid $dgv
     if (-not $t) { return }
 
-    $allDc = [bool]$chkAllDc.Checked
     $items = @(foreach ($h in $t.Hosts) {
-        [pscustomobject]@{ Key = $h; Params = @{ ComputerName = $h; QueryAllDCs = $allDc } }
+        [pscustomobject]@{ Key = $h; Params = @{ ComputerName = $h } }
     })
     $lblStatus.Text = "AD yapisi kontrolu: $(@($t.Hosts).Count) makine ($($t.Source))"
     Set-GridPending -Hosts $t.Hosts -ClearError -Columns @('DnsStatus', 'IsOnline', 'AdStatus', 'LastLogon', 'ActionResult')
@@ -2583,8 +3406,13 @@ $btnAction.Add_Click({
     $t = Get-TargetHosts -Grid $dgv
     if (-not $t) { return }
 
+    $note = switch ($ids[0]) {
+        '@REPAIR'  { "`n`nccmrepair hedefte arka planda calisir (birkac dakika); bu sirada SCCM ajani yeniden baslar ve eylem / script almaz." }
+        '@RESTART' { "`n`nCcmExec (SMS Agent Host) durdurulup baslatilacak; o anda calisan SCCM islemleri (kurulum, tarama) kesilebilir." }
+        default    { '' }
+    }
     $confirm = [System.Windows.Forms.MessageBox]::Show(
-        "Eylem: $actionName`n`nHedef ($($t.Source)): $(@($t.Hosts).Count) makine`n$(Format-HostPreview -Hosts $t.Hosts)`n`nGonderilsin mi?",
+        "Eylem: $actionName`n`nHedef ($($t.Source)): $(@($t.Hosts).Count) makine`n$(Format-HostPreview -Hosts $t.Hosts)$note`n`nGonderilsin mi?",
         'Onay', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
     if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
 
@@ -2677,7 +3505,7 @@ $btnExcel1.Add_Click({
         [System.Windows.Forms.MessageBox]::Show('Aktarilacak sonuc yok.', 'Bilgi') | Out-Null
         return
     }
-    Export-ToExcelAndOpen -Data (Get-GridExportData -Grid $dgv -Source $script:BindingSrc -WithDetail $true) -DefaultFileName "IstemciRaporu_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    Export-ToExcelAndOpen -Data (Get-GridExportData -Grid $dgv -Source $script:BindingSrc -WithDetail $true) -DefaultFileName (Get-ExportStamp)
 })
 
 $btnCsv1.Add_Click({
@@ -2685,7 +3513,7 @@ $btnCsv1.Add_Click({
         [System.Windows.Forms.MessageBox]::Show('Aktarilacak sonuc yok.', 'Bilgi') | Out-Null
         return
     }
-    Export-GridToCsv -Data (Get-GridExportData -Grid $dgv -Source $script:BindingSrc -WithDetail $true) -DefaultFileName "IstemciRaporu_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    Export-GridToCsv -Data (Get-GridExportData -Grid $dgv -Source $script:BindingSrc -WithDetail $true) -DefaultFileName (Get-ExportStamp)
 })
 
 # ---------- Panel 2 (Update Parser) olaylari - Panel 1'e DOKUNMAZ ----------
@@ -2702,11 +3530,11 @@ $btnExcel2.Add_Click({
         [System.Windows.Forms.MessageBox]::Show('Aktarilacak parser verisi yok.', 'Bilgi') | Out-Null
         return
     }
-    Export-ToExcelAndOpen -Data (Get-GridExportData -Grid $dgvParse -Source $script:ParseBinding -SkipColumns @('KolonUyumu')) -DefaultFileName "$(Get-Date -Format 'dd-HH')-updates"
+    Export-ToExcelAndOpen -Data (Get-GridExportData -Grid $dgvParse -Source $script:ParseBinding -SkipColumns @('KolonUyumu')) -DefaultFileName (Get-ExportStamp)
 })
 
 $btnCsv2.Add_Click({
-    # Eski parser gibi: kayit klasorune "<gun-saat>-updates.csv" yazar ve otomatik acar.
+    # Kayit klasorune "<gun-ay-saat-dakika>.csv" yazar ve otomatik acar (Excel ile ayni zaman damgasi).
     $lblParserStatus.ForeColor = [System.Drawing.Color]::DarkRed
     if ($script:ParseTable.Rows.Count -eq 0) {
         $lblParserStatus.Text = 'Aktarilacak parser verisi yok.'
@@ -2725,7 +3553,7 @@ $btnCsv2.Add_Click({
         }
     }
 
-    $fullPath = Join-Path $folder ("{0}-updates.csv" -f (Get-Date -Format 'dd-HH'))
+    $fullPath = Join-Path $folder ("{0}.csv" -f (Get-ExportStamp))
     $data = Get-GridExportData -Grid $dgvParse -Source $script:ParseBinding -SkipColumns @('KolonUyumu')
     try { $data | Export-Csv -Path $fullPath -NoTypeInformation -Encoding UTF8 -Delimiter ';' -Force }
     catch {
@@ -2757,8 +3585,9 @@ $btnParseRun.Add_Click({
 
     if (-not $chkParseAppend.Checked) {
         $script:ParseTable.Rows.Clear()
-        $script:ParserNoOutput = @{}
+        $script:ParserNoOutput.Clear()
         $script:ParserDetails.Clear()
+        $script:ParserSvc.Clear()
     }
 
     $script:ParsePasteSeq++
@@ -2786,14 +3615,13 @@ $btnParseRun.Add_Click({
 })
 
 $btnParseScript.Add_Click({ Start-ScriptSend -Panel 2 })
+$btnParseFix.Add_Click({ Start-ServiceFix -Panel 2 })
+$btnParseCancel.Add_Click({ Stop-PanelRun -Panel 2 })
+$btnCancel1.Add_Click({ Stop-PanelRun -Panel 1 })
 
 $btnParseRecheck.Add_Click({
-    $hostsToCheck = @()
+    $hostsToCheck = @(Get-SelectedHosts -Grid $dgvParse)
     $src = 'secili satirlar'
-    foreach ($r in $dgvParse.SelectedRows) {
-        $h = [string]$r.Cells['Hostname'].Value
-        if ($h -and ($h -match $script:HostRegex) -and ($hostsToCheck -notcontains $h)) { $hostsToCheck += $h }
-    }
     if ($hostsToCheck.Count -eq 0) {
         $src = 'tablodaki tum cihazlar'
         foreach ($row in $script:ParseTable.Rows) {
@@ -2817,8 +3645,9 @@ $btnParseClear.Add_Click({
         [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
     if ($c -ne [System.Windows.Forms.DialogResult]::Yes) { return }
     $script:ParseTable.Rows.Clear()
-    $script:ParserNoOutput = @{}
+    $script:ParserNoOutput.Clear()
     $script:ParserDetails.Clear()
+    $script:ParserSvc.Clear()
     Update-ParserInfo
 })
 # ---------- Grid focus / secim birakma (iki panel icin) ----------
@@ -2836,36 +3665,22 @@ function Clear-GridFocus {
 $btnUnfocus1.Add_Click({ Clear-GridFocus -Grid $dgv })
 $btnUnfocus2.Add_Click({ Clear-GridFocus -Grid $dgvParse })
 
-# Tablonun BOS alanina (satirlarin altina) tiklayinca veya Esc'ye basinca da secim / focus kalkar
-foreach ($g in @($dgv, $dgvParse)) {
-    $g.Add_MouseDown({
-        param($s, $e)
-        if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
-        $hit = $s.HitTest($e.X, $e.Y)
-        if ($hit.Type -eq [System.Windows.Forms.DataGridViewHitTestType]::None) { Clear-GridFocus -Grid $s }
-    })
-    $g.Add_KeyDown({
-        param($s, $e)
-        if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape) {
-            Clear-GridFocus -Grid $s
-            $e.Handled = $true
-        }
-    })
-}
-
-$script:Tip = New-Object System.Windows.Forms.ToolTip
-$script:Tip.SetToolTip($btnUnfocus1, 'Tablodaki secimi ve aktif hucreyi kaldirir; hedef tekrar soldaki liste olur. (Tablonun bos alanina tiklamak veya Esc de ayni isi yapar.)')
-$script:Tip.SetToolTip($btnUnfocus2, 'Tablodaki secimi ve aktif hucreyi kaldirir; hedef tekrar soldaki liste olur. (Tablonun bos alanina tiklamak veya Esc de ayni isi yapar.)')
-
 # ==================== FORM KAPANIRKEN TEMIZLIK ====================
 
 $form.Add_FormClosing({
     Save-Settings
     if ($script:RunTimer.Enabled) { $script:RunTimer.Stop() }
-    if ($script:SharedPool) { try { $script:SharedPool.Close(); $script:SharedPool.Dispose() } catch { } }
+    $script:SummaryTimer.Stop(); $script:AutoTimer.Stop()
+    foreach ($pf in @($script:Prefetch)) { try { [void]$pf.Job.PS.BeginStop($null, $null) } catch { } }
+    # Calisan isler beklenmeden durdurulur (asenkron; uzun WMI cagrisi pencerenin kapanmasini geciktirmesin)
+    foreach ($st in @($script:ActiveRuns)) { foreach ($j in $st.Jobs) { if (-not $j.Done) { try { [void]$j.PS.BeginStop($null, $null) } catch { } } } }
+    foreach ($j in @(@($script:ScriptPoll | ForEach-Object { $_.Job }) + $script:PollJob)) { if ($j) { try { [void]$j.PS.BeginStop($null, $null) } catch { } } }
+    if ($script:PollRunspace) { try { $script:PollRunspace.CloseAsync() } catch { } }
+    if ($script:SharedPool) { try { [void]$script:SharedPool.BeginClose($null, $null) } catch { } }
 })
 
 # ==================== BASLANGIC ====================
 
 Import-Settings
+Update-AdCacheLabel
 [void]$form.ShowDialog()
