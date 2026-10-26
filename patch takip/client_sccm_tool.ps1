@@ -92,10 +92,6 @@ $script:RetryButtons   = @{}
 $script:SumDirty       = @{ 1 = $true; 2 = $true }
 $script:DirtyRows      = New-Object 'System.Collections.Generic.HashSet[object]'   # V7: Durum'u yeniden hesaplanacak Panel 2 satirlari
 $script:Auto           = @{}          # V13: panel -> otomatik yenileme ayarlari
-$script:AdProgress     = $null        # AD onbellek guncelleme ilerlemesi (senkronize hashtable; worker'lar yazar)
-$script:AdProgOrder    = @()
-$script:AdSaveSummary  = ''
-$script:AdStart        = $null
 $script:SccmExtra      = New-NameMap  # kisa ad -> @(Boundary Group(s), Operating System Build) (son toplu SCCM sorgusundan)
 $script:ReportQueue    = New-Object System.Collections.ArrayList   # gosterilmeyi bekleyen servis baslatma raporlari
 $script:ShowingReport  = $false
@@ -103,7 +99,6 @@ $script:ParserSvc      = New-NameMap  # Panel 2: Hostname -> son servis durumu (
 
 # AD ONBELLEGI domain / OU eslemesi (ClientToolSettings.json'da saklanir). OU = DistinguishedName (alt OU'lar dahil taranir)
 $script:AdCacheSources = @()
-$script:AdCacheNew     = New-NameMap  # guncelleme sirasinda: Domain -> worker sonucu
 $script:ParserDefaultFolder = Join-Path $env:USERPROFILE 'Desktop\SCCM-Raporlari'
 
 # Update Parser basligi (21 kolon). Eski 19 kolonluk cikti (client_update_parser.ps1) kolon ADIYLA yerlestirilir.
@@ -455,40 +450,6 @@ function Get-AdCacheIndex {
     }
     catch { $r.Error = "AD onbellegi okunamadi: $($_.Exception.Message)"; return $r }
     finally { if ($lock) { [System.Threading.Monitor]::Exit($lock) } }
-}
-
-function Get-AdOuComputers {
-    # Her OU: $data = Get-ADComputer ... ; $data | Export-Csv <dosya>. Baska hicbir sey yok.
-    # Hata olursa Export-Csv'ye gelinmez, o OU'nun eski dosyasi yerinde kalir.
-    param([string]$Domain, [string[]]$SearchBases, $Progress, [string]$CacheDir)
-
-    $items = New-Object System.Collections.ArrayList
-    $modErr = ''
-    if (-not (Get-Module -Name ActiveDirectory)) {
-        # AD: surucusu olusturulmasin (varsayilan DC'ye baglanmaya calisip modul yuklemesini saniyelerce geciktirir)
-        $env:ADPS_LoadDefaultDrive = 0
-        try { Import-Module -Name ActiveDirectory -ErrorAction Stop -Verbose:$false }
-        catch { $modErr = "ActiveDirectory modulu (RSAT) yuklenemedi: $($_.Exception.Message)" }
-    }
-
-    foreach ($sb in @($SearchBases)) {
-        $key = "$Domain [$sb]"
-        $it = [pscustomobject]@{ SearchBase = [string]$sb; Ok = $false; Error = ''; Count = 0; Seconds = 0 }
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        try {
-            if ($modErr) { throw $modErr }
-            if ($Progress) { $Progress[$key] = @(0, 'okunuyor', 0) }
-            $data = Get-ADComputer -Filter * -SearchBase $sb -Server $Domain -ResultSetSize $null -ResultPageSize 1000 -Properties Enabled, LastLogonTimestamp -ErrorAction Stop
-            $data | Export-Csv -LiteralPath (Join-Path $CacheDir (Get-AdCacheFileName -Domain $Domain -OU $sb)) -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
-            $it.Count = @($data).Count
-            $it.Ok = $true
-        }
-        catch { $it.Error = "AD sorgusu / yazma basarisiz: $($_.Exception.Message)" }
-        $it.Seconds = [int]$sw.Elapsed.TotalSeconds
-        if ($Progress) { $Progress[$key] = @($it.Count, $(if ($it.Ok) { 'bitti' } else { 'hata' }), $it.Seconds) }
-        [void]$items.Add($it)
-    }
-    return [pscustomobject]@{ Domain = $Domain; Items = $items }
 }
 
 function Get-AdComputerInfo {
@@ -988,7 +949,7 @@ function New-WorkerScript {
     # Ortak fonksiyonlarin kaynak kodunu worker scriptinin basina gomer; tanimlar TEK yerde tutulur.
     param([string]$ParamLine, [string]$CallLine, [string[]]$Funcs)
     $all = @('ConvertTo-WqlString', 'Get-ErrText', 'Test-Ping', 'Test-TcpPort', 'Get-NetBiosName', 'Get-WmiFailureReason', 'Get-WmiComputerName',
-        'Get-DnsWildcardIps', 'Resolve-HostDns', 'Get-HostReach', 'Get-AdCacheFileName', 'ConvertTo-LastLogon', 'ConvertTo-DomainFromDn', 'Get-AdCacheIndex', 'Get-AdOuComputers', 'Get-AdComputerInfo', 'Get-ServiceCheck',
+        'Get-DnsWildcardIps', 'Resolve-HostDns', 'Get-HostReach', 'Get-AdCacheFileName', 'ConvertTo-LastLogon', 'ConvertTo-DomainFromDn', 'Get-AdCacheIndex', 'Get-AdComputerInfo', 'Get-ServiceCheck',
         'Get-RemoteStatus', 'Start-RemoteFix', 'Invoke-SccmClientAction', 'Get-NoResponseVerdict', 'Get-SccmDevice', 'Send-SccmScript',
         'Get-AdStructureStatus', 'New-SkippedScript', 'Invoke-ScriptWithAdCheck', 'Get-SccmRegistration', 'Get-ParserHostCheck', 'Invoke-ParserScriptRun')
     $defs = foreach ($n in $(if ($Funcs) { $Funcs } else { $all })) { "function $n {`n$((Get-Item -Path "function:$n").ScriptBlock.ToString())`n}" }
@@ -1000,7 +961,6 @@ $script:FixWorker          = New-WorkerScript '$ComputerName, $ServiceDetail' 'S
 $script:ActionWorker       = New-WorkerScript '$ComputerName, $ActionName, $ScheduleIds' 'Invoke-SccmClientAction -ComputerName $ComputerName -ActionName $ActionName -ScheduleIds $ScheduleIds'
 $script:ScriptWorker       = New-WorkerScript '$ComputerName, $SmsProvider, $SiteCode, $ScriptGuid, $ScriptName, $ParamB64, $TimeoutSec, $ServiceNames, $SccmInfo' 'Invoke-ScriptWithAdCheck -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -ScriptGuid $ScriptGuid -ScriptName $ScriptName -ParamB64 $ParamB64 -TimeoutSec $TimeoutSec -ServiceNames $ServiceNames -SccmInfo $SccmInfo'
 $script:AdWorker           = New-WorkerScript '$ComputerName' 'Get-AdStructureStatus -ComputerName $ComputerName'
-$script:AdCacheWorker      = New-WorkerScript '$Domain, $SearchBases, $Progress, $CacheDir' 'Get-AdOuComputers -Domain $Domain -SearchBases $SearchBases -Progress $Progress -CacheDir $CacheDir' @('Get-AdCacheFileName', 'Get-AdOuComputers')
 $script:ParserCheckWorker  = New-WorkerScript '$ComputerName, $SmsProvider, $SiteCode, $ServiceNames, $SccmInfo' 'Get-ParserHostCheck -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -ServiceNames $ServiceNames -SccmInfo $SccmInfo'
 $script:VerdictWorker      = New-WorkerScript '$ComputerName, $TimeoutSec' 'Get-NoResponseVerdict -ComputerName $ComputerName -TimeoutSec $TimeoutSec'
 $script:PollWorker         = New-WorkerScript '$Items' 'Get-ScriptPollStatus -Items $Items' @('ConvertTo-WqlString', 'Select-ScriptStatusRow', 'Get-ScriptPollStatus')
@@ -1411,7 +1371,6 @@ $script:RunTimer.Add_Tick({
         }
         $w = Get-RunWaitCount $st
         $txt = "$($st.Title): $($st.Done) / $($st.Total) tamamlandi (ayni anda en fazla $($script:MaxParallel) istek)"
-        if ($st.Unit -eq 'domain') { $txt = "AD onbellek guncelleme ($([int]((Get-Date) - $script:AdStart).TotalSeconds) sn)  |  $(Format-AdProgress)" }
         if ($w -gt 0) {
             $txt += "  |  $w cihazin script sonucu bekleniyor (toplu yoklama: 4 sn'de bir tek sorgu, $($script:PollCount). tur)"
             if ($script:PollError) { $txt += "  |  Son yoklama hatasi: $($script:PollError)" }
@@ -1420,7 +1379,7 @@ $script:RunTimer.Add_Tick({
         if (-not $pending -and $w -eq 0) {
             [void]$script:ActiveRuns.Remove($st)
             if ($st.Report -and $st.Report.Count -gt 0) { [void]$script:ReportQueue.Add($st) }
-            $lbl.Text = if ($st.Unit -eq 'domain' -and $script:AdSaveSummary) { $script:AdSaveSummary } else { "$($st.Title) tamamlandi. $($st.Total) $($st.Unit) islendi." }
+            $lbl.Text = "$($st.Title) tamamlandi. $($st.Total) $($st.Unit) islendi."
             Set-UiBusy -Panel $st.Panel -Busy $false
             if ($st.Panel -eq 2) { Update-ParserInfo }
         }
@@ -1593,65 +1552,6 @@ function Update-GridFromAd {
 
 # ---------- AD onbellegi (CSV) guncelleme (UI thread'i) ----------
 
-function Update-AdCacheFromWorker {
-    # Her domain'in sonucu geldikce toplanir; hepsi gelince ozet (dosyalar worker'larda zaten yazildi).
-    param($Key, $Output, $ErrorText)
-
-    $r = @($Output | Where-Object { $_ -and $_.PSObject.Properties['Items'] -and $_.PSObject.Properties['Domain'] })[0]
-    if (-not $r) {
-        # Is hic sonuc donmedi: bu domain'in tum OU'lari basarisiz sayilir
-        $fail = foreach ($s in @($script:AdCacheSources | Where-Object { $_.Domain -eq $Key })) {
-            [pscustomobject]@{ SearchBase = [string]$s.OU; Ok = $false; Error = (Format-JobError $ErrorText); Count = 0; Seconds = 0 }
-        }
-        $r = [pscustomobject]@{ Domain = [string]$Key; Items = @($fail) }
-    }
-    $script:AdCacheNew[[string]$Key] = $r
-
-    $domains = @($script:AdCacheSources | Group-Object -Property Domain).Count   # buyuk/kucuk harf duyarsiz
-    if ($script:AdCacheNew.Count -ge $domains) { Complete-AdCacheUpdate }
-}
-
-function Complete-AdCacheUpdate {
-    # Tum domain'ler bitti: ozet + artik tanimli olmayan OU dosyalarinin temizligi + etiket. Birlestirme / yeniden yazma YOK.
-    $dir = Get-AdCacheDir
-    $okCount = 0; $total = 0
-    $parts    = New-Object 'System.Collections.Generic.List[string]'
-    $problems = New-Object 'System.Collections.Generic.List[string]'
-    $keep     = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($s in @($script:AdCacheSources)) {
-        $dom = [string]$s.Domain; $ou = [string]$s.OU
-        [void]$keep.Add((Get-AdCacheFileName -Domain $dom -OU $ou))
-        $r = $null
-        $dr = $script:AdCacheNew[$dom]
-        if ($dr) { foreach ($x in $dr.Items) { if ($x.SearchBase -eq $ou) { $r = $x; break } } }
-        if ($r -and $r.Ok) { $okCount++; $total += $r.Count; $parts.Add(("{0} [{1}]: {2:N0} ({3} sn)" -f $dom, $ou, $r.Count, $r.Seconds)) }
-        else {
-            $why = if ($r -and $r.Error) { $r.Error } else { 'sonuc alinamadi' }
-            $old = Join-Path $dir (Get-AdCacheFileName -Domain $dom -OU $ou)
-            $problems.Add("${dom} [$ou]: $why`n   ($(if (Test-Path -LiteralPath $old) { 'eski dosya korundu' } else { 'bu OU icin onbellek yok' }))")
-        }
-    }
-    # Ayarlardan cikarilmis OU'larin dosyalari (ve yarim kalmis .tmp'ler) silinir; hepsi basariliysa eski tek dosya da.
-    foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue)) {
-        if ($f.Extension -eq '.tmp' -or ($f.Extension -eq '.csv' -and -not $keep.Contains($f.Name))) { try { Remove-Item -LiteralPath $f.FullName -Force } catch { } }
-    }
-    if ($okCount -eq @($script:AdCacheSources).Count -and (Test-Path -LiteralPath (Get-AdCacheFile))) { try { Remove-Item -LiteralPath (Get-AdCacheFile) -Force } catch { } }
-
-    $idx  = Get-AdCacheIndex
-    $secs = if ($script:AdStart) { [int]((Get-Date) - $script:AdStart).TotalSeconds } else { 0 }
-    $uniq = if ($idx.Ok) { $idx.Unique } else { 0 }
-    $script:AdSaveSummary = ("AD onbellegi guncellendi ({0} sn): AD'den {1:N0} kayit okundu, onbellekte {2:N0} tekil makine | {3}/{4} OU basarili | {5}" -f
-        $secs, $total, $uniq, $okCount, @($script:AdCacheSources).Count, ($parts -join ' | '))
-    if ($okCount -eq 0) { $script:AdSaveSummary = "AD onbellegi GUNCELLENMEDI: hicbir OU'dan veri alinamadi (mevcut dosyalar korundu)." }
-    Update-AdCacheLabel
-    $state = if ($okCount -eq 0) { 'fail' } elseif ($problems.Count -gt 0) { 'warn' } else { 'ok' }
-    Write-ActionLog -Hostname '-' -Action 'AD onbellek guncelleme' -State $state -Text ((@($script:AdSaveSummary) + @($problems)) -join ' | ')
-    if ($problems.Count -gt 0) {
-        $title = if ($okCount -eq 0) { "Hicbir OU'dan veri alinamadi; mevcut onbellek DEGISTIRILMEDI." } else { "Onbellek guncellendi ancak bazi OU'lar alinamadi:" }
-        [System.Windows.Forms.MessageBox]::Show("$title`n`n" + ($problems -join "`n`n"), 'AD Onbellegi', 'OK', $(if ($okCount -eq 0) { 'Error' } else { 'Warning' })) | Out-Null
-    }
-}
-
 function Update-AdCacheLabel {
     # Onbellek durumunu (tekil makine + kayit + son guncelleme zamani) kontrol grubundaki etikete yazar.
     $idx = Get-AdCacheIndex
@@ -1757,44 +1657,65 @@ function Show-AdCacheDialog {
     if ($doUpdate) { Start-AdCacheUpdate }   # pencere kapandiktan sonra (arka planda, UI donmaz)
 }
 
-function Format-AdProgress {
-    # Durum cubugu: "Toplam: 25.300 makine okundu (3 OU: 1 bitti, 1 okunuyor, 1 sirada) | dom1 [OU=..]: 12.500 bitti (8 sn) | ..."
-    $p = $script:AdProgress
-    if (-not $p) { return '' }
-    $tot = 0; $st = @{}
-    $parts = foreach ($k in $script:AdProgOrder) {
-        $v = $p[$k]
-        if (-not $v) { continue }
-        $tot += [int]$v[0]
-        $st[$v[1]] = 1 + [int]$st[$v[1]]
-        $ou = ($k -replace '\[(OU|CN)=([^,\]]+)[^\]]*\]', '[$2]')   # durum cubugunda OU'nun sadece ilk adi
-        "{0}: {1:N0} {2}{3}" -f $ou, [int]$v[0], $v[1], $(if ($v[2]) { " ($($v[2]) sn)" } else { '' })
-    }
-    $cnt = (@('bitti', 'yaziliyor', 'okunuyor', 'sirada', 'hata') | Where-Object { $st[$_] } | ForEach-Object { "$($st[$_]) $_" }) -join ', '
-    return ("Toplam: {0:N0} makine okundu ({1} OU: {2})  |  " -f $tot, @($script:AdProgOrder).Count, $cnt) + (@($parts) -join '  |  ')
-}
-
 function Start-AdCacheUpdate {
-    # Kullanici isterse: kayitli domain / OU eslemesindeki her OU AD'den taranir ve CSV onbellegi yeniden yazilir.
-    # Domain basina TEK is baslatilir; o domain'in OU'lari is icinde sirayla taranir.
-    # Ilerleme: $script:AdProgress (senkronize) -> durum cubugunda OU bazinda canli "N makine okundu".
+    # AD onbellegi guncelleme: ana pencerede, SIRAYLA, basit dongu. Her domain / OU icin:
+    #   $data = Get-ADComputer ... ; $data | Export-Csv <dosya>
+    # Hata veren OU'nun eski dosyasi yerinde kalir. Paralellik / worker yok.
     $src = @($script:AdCacheSources)
     if ($src.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("Once 'AD Onbellegi...' penceresinden en az bir domain / OU girin.", 'Uyari') | Out-Null
         return
     }
+    if (-not (Get-Module -Name ActiveDirectory)) {
+        $env:ADPS_LoadDefaultDrive = 0   # AD: surucusu olusturulmasin (yuklemede varsayilan DC'ye baglanmaz)
+        try { Import-Module -Name ActiveDirectory -ErrorAction Stop -Verbose:$false }
+        catch { [System.Windows.Forms.MessageBox]::Show("ActiveDirectory modulu (RSAT) yuklenemedi:`n$($_.Exception.Message)", 'AD Onbellegi', 'OK', 'Error') | Out-Null; return }
+    }
 
-    $script:AdCacheNew  = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
-    $script:AdProgress  = [hashtable]::Synchronized(@{})
-    $script:AdProgOrder = @($src | ForEach-Object { "$($_.Domain) [$($_.OU)]" })
-    foreach ($k in $script:AdProgOrder) { $script:AdProgress[$k] = @(0, 'sirada', 0) }
-    $script:AdSaveSummary = ''
-    $script:AdStart = Get-Date
-    $items = @(foreach ($g in ($src | Group-Object -Property Domain)) {
-        $ous = [string[]]@($g.Group | ForEach-Object { [string]$_.OU })
-        [pscustomobject]@{ Key = [string]$g.Name; Params = @{ Domain = [string]$g.Name; SearchBases = $ous; Progress = $script:AdProgress; CacheDir = (Get-AdCacheDir) } }
-    })
-    Start-ParallelRun -Title 'AD onbellek guncelleme' -Worker $script:AdCacheWorker -Items $items -OnResultFn 'Update-AdCacheFromWorker' -Unit 'domain'
+    $dir = Get-AdCacheDir
+    $ok = 0; $total = 0
+    $done = New-Object System.Collections.Generic.List[string]
+    $errs = New-Object System.Collections.Generic.List[string]
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Set-UiBusy -Panel 1 -Busy $true
+    $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    try {
+        for ($i = 0; $i -lt $src.Count; $i++) {
+            $domain = [string]$src[$i].Domain
+            $sb     = [string]$src[$i].OU
+            $lblStatus.ForeColor = [System.Drawing.Color]::DarkBlue
+            $lblStatus.Text = "AD onbellek: $($i + 1) / $($src.Count)  $domain [$sb] cekiliyor...  (bitenler: $($done -join ' | '))"
+            [System.Windows.Forms.Application]::DoEvents()
+            $t = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+                $data = Get-ADComputer -Filter * -SearchBase $sb -Server $domain -ResultSetSize $null -ResultPageSize 1000 -Properties Enabled, LastLogonTimestamp -ErrorAction Stop
+                $data | Export-Csv -LiteralPath (Join-Path $dir (Get-AdCacheFileName -Domain $domain -OU $sb)) -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+                $n = @($data).Count
+                $ok++; $total += $n
+                $done.Add(("{0}: {1:N0} ({2} sn)" -f $domain, $n, [int]$t.Elapsed.TotalSeconds))
+            }
+            catch {
+                $errs.Add("$domain [$sb]: $($_.Exception.Message)")
+                $done.Add("${domain}: HATA")
+            }
+        }
+        # Ayarlardan cikarilmis OU'larin dosyalari silinir
+        $keep = @($src | ForEach-Object { Get-AdCacheFileName -Domain $_.Domain -OU $_.OU })
+        Get-ChildItem -LiteralPath $dir -Filter '*.csv' -File -ErrorAction SilentlyContinue | Where-Object { $keep -notcontains $_.Name } | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+    finally {
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        Set-UiBusy -Panel 1 -Busy $false
+    }
+
+    Update-AdCacheLabel
+    $msg = "AD onbellegi: {0}/{1} OU basarili, {2:N0} makine yazildi ({3} sn)  |  {4}" -f $ok, $src.Count, $total, [int]$sw.Elapsed.TotalSeconds, ($done -join ' | ')
+    $lblStatus.ForeColor = $(if ($errs.Count) { [System.Drawing.Color]::DarkOrange } else { [System.Drawing.Color]::DarkGreen })
+    $lblStatus.Text = $msg
+    Write-ActionLog -Hostname '-' -Action 'AD onbellek guncelleme' -State $(if ($ok -eq 0) { 'fail' } elseif ($errs.Count) { 'warn' } else { 'ok' }) -Text ((@($msg) + @($errs)) -join ' | ')
+    if ($errs.Count -gt 0) {
+        [System.Windows.Forms.MessageBox]::Show("Bazi OU'lar alinamadi (eski dosyalari korundu):`n`n" + ($errs -join "`n`n"), 'AD Onbellegi', 'OK', 'Warning') | Out-Null
+    }
 }
 
 # ---------- SCCM yardimcilari (UI thread'i) ----------
