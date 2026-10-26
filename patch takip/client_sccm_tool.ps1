@@ -94,6 +94,7 @@ $script:DirtyRows      = New-Object 'System.Collections.Generic.HashSet[object]'
 $script:Auto           = @{}          # V13: panel -> otomatik yenileme ayarlari
 $script:AdData         = $null        # AD verisi: Get-ADComputer ciktisi OLDUGU GIBI (girilen OU'lar); sorgu: $AdData.Where({ $_.Name -eq <host> })
 $script:AdDataTime     = $null
+$script:AdLoadJob      = $null        # AD verisini arka planda ceken is (ana ekran kilitlenmez)
 $global:ClientToolUi   = $true        # Get-AdComputerInfo sadece ana pencerede $AdData'ya bakar (worker'larda bos doner)
 $script:SccmExtra      = New-NameMap  # kisa ad -> @(Boundary Group(s), Operating System Build) (son toplu SCCM sorgusundan)
 $script:ReportQueue    = New-Object System.Collections.ArrayList   # gosterilmeyi bekleyen servis baslatma raporlari
@@ -391,19 +392,23 @@ function Write-FastCsv {
 
 function Get-AdComputerInfo {
     # $AdData'ya sorgu: $AdData.Where({ $_.Name -eq <hostname> }, 'First'). Veri Get-ADComputer'dan geldigi gibi durur.
-    # SADECE ana pencerede calisir (AD modulu orada yuklu); paralel worker'larda bos doner, AD kolonlari sonuc gelince
-    # ana pencerede (Set-AdInfo) doldurulur.
+    # SADECE ana pencerede calisir; paralel worker'larda bos doner, AD kolonlari sonuc gelince ana pencerede (Set-AdInfo) doldurulur.
     param([string]$ComputerName)
     $res = [pscustomobject]@{ Status = ''; LastLogon = ''; Detail = '' }
     if (-not $global:ClientToolUi) { return $res }
-    if ($null -eq $script:AdData) { $res.Status = 'Sorgulanamadi'; $res.Detail = "AD verisi yuklenmedi ('AD Verisi...' > 'Kaydet ve AD Verisini Yukle')"; return $res }
-
+    if ($null -eq $script:AdData) {
+        $res.Status = if ($script:AdLoadJob) { 'Yukleniyor' } else { 'Sorgulanamadi' }
+        $res.Detail = if ($script:AdLoadJob) { 'AD verisi yukleniyor; bitince AD kolonlari otomatik dolar' } else { "AD verisi yuklenmedi ('AD Verisi...' > 'Kaydet ve AD Verisini Yukle')" }
+        return $res
+    }
     $short = (([string]$ComputerName -split '\.')[0]).Trim()
     $c = $script:AdData.Where({ $_.Name -eq $short }, 'First')
     if ($c.Count -eq 0) { $res.Status = 'Bulunamadi'; $res.LastLogon = 'N/A'; $res.Detail = "AD verisinde (girilen OU'larda) yok"; return $res }
     $c = $c[0]
+    $ll = $c.LastLogonTimestamp
+    if ($null -eq $ll) { try { $ll = $c['LastLogonTimestamp'].Value } catch { } }   # AD modulu bu runspace'te yuklu degilse indeksleyici
     $res.Status = if ($c.Enabled) { 'Enabled' } else { 'Disabled' }
-    $res.LastLogon = if ($c.LastLogonTimestamp) { [DateTime]::FromFileTime([long]$c.LastLogonTimestamp).ToString('yyyy-MM-dd HH:mm') } else { 'Hic' }
+    $res.LastLogon = if ($ll) { [DateTime]::FromFileTime([long]$ll).ToString('yyyy-MM-dd HH:mm') } else { 'Hic' }
     return $res
 }
 
@@ -1476,54 +1481,82 @@ function Update-GridFromAd {
 # ---------- AD onbellegi (CSV) guncelleme (UI thread'i) ----------
 
 function Start-AdLoad {
-    # AD verisi: ana pencerede, sirayla. Veri oldugu gibi $script:AdData'ya eklenir:
-    #   $AdData = @(); $AdData += Get-ADComputer -Filter * -SearchBase $sb -Server $domain ...
-    # Bir OU hata verirse o OU'nun onceki verisi (DN'si o OU ile biten nesneler) korunur.
+    # AD verisi ARKA PLANDA (ayri runspace; ana ekran kilitlenmez), sirayla:
+    #   $data = Get-ADComputer -Filter * -SearchBase $sb -Server $domain ...   -> nesneler OLDUGU GIBI ana pencereye doner
+    # Bitince $script:AdData = @(); $script:AdData += ... (Update-AdLoad). Bir OU hata verirse onceki verisi korunur.
     $src = @($script:AdCacheSources)
     if ($src.Count -eq 0) { Update-AdCacheLabel; return }
-    if (-not (Get-Module -Name ActiveDirectory)) {
-        try { Import-Module -Name ActiveDirectory -ErrorAction Stop -Verbose:$false }
-        catch { [System.Windows.Forms.MessageBox]::Show("ActiveDirectory modulu (RSAT) yuklenemedi:`n$($_.Exception.Message)", 'AD Verisi', 'OK', 'Error') | Out-Null; return }
-    }
-    $old  = $script:AdData
-    $new  = @()
-    $done = @(); $errs = @()
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    $btnAdCache.Enabled = $false
-    try {
-        for ($i = 0; $i -lt $src.Count; $i++) {
-            $domain = [string]$src[$i].Domain
-            $sb     = [string]$src[$i].OU
-            $lblAdCache.ForeColor = [System.Drawing.Color]::DarkBlue
-            $lblAdCache.Text = "AD yukleniyor: $($i + 1) / $($src.Count)  $domain"
-            [System.Windows.Forms.Application]::DoEvents()
+    if ($script:AdLoadJob) { return }
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript({
+        param($Sources)
+        Import-Module -Name ActiveDirectory -ErrorAction Stop -Verbose:$false
+        for ($i = 0; $i -lt $Sources.Count; $i++) {
+            $d = $Sources[$i].Domain; $sb = $Sources[$i].OU
+            [System.AppDomain]::CurrentDomain.SetData('ClientTool.AdLoadStatus', "$($i + 1) / $($Sources.Count)  $d")
             $t = [System.Diagnostics.Stopwatch]::StartNew()
             try {
-                $data = @(Get-ADComputer -Filter * -SearchBase $sb -Server $domain -ResultSetSize $null -ResultPageSize 1000 -Properties Enabled, LastLogonTimestamp -ErrorAction Stop)
-                $new += $data
-                $done += "{0}: {1:N0} ({2} sn)" -f $domain, $data.Count, [int]$t.Elapsed.TotalSeconds
+                $data = @(Get-ADComputer -Filter * -SearchBase $sb -Server $d -ResultSetSize $null -ResultPageSize 1000 -Properties Enabled, LastLogonTimestamp -ErrorAction Stop)
+                [pscustomobject]@{ Domain = $d; OU = $sb; Ok = $true; Data = $data; Seconds = [int]$t.Elapsed.TotalSeconds; Error = '' }
             }
-            catch {
-                $errs += "$domain [$sb]: $($_.Exception.Message)"
-                $done += "${domain}: HATA"
-                if ($old) { $new += $old.Where({ ([string]$_.DistinguishedName).EndsWith($sb, [System.StringComparison]::OrdinalIgnoreCase) }) }
-            }
+            catch { [pscustomobject]@{ Domain = $d; OU = $sb; Ok = $false; Data = @(); Seconds = [int]$t.Elapsed.TotalSeconds; Error = $_.Exception.Message } }
         }
-        $script:AdData = $new
-        $script:AdDataTime = Get-Date
+    }).AddParameter('Sources', [object[]]@($src | ForEach-Object { [pscustomobject]@{ Domain = [string]$_.Domain; OU = [string]$_.OU } }))
+    $script:AdLoadJob = [pscustomobject]@{ PS = $ps; Async = $ps.BeginInvoke(); Key = 'ad'; Done = $false; Start = (Get-Date) }
+    $btnAdCache.Enabled = $false
+    $lblAdCache.ForeColor = [System.Drawing.Color]::DarkBlue
+    $lblAdCache.Text = 'AD verisi yukleniyor...'
+}
+
+function Update-AdLoad {
+    # SummaryTimer'dan (0,5 sn): yukleme surerken etiket; bitince $AdData + ozet + acik tablolardaki AD kolonlari yenilenir.
+    $j = $script:AdLoadJob
+    if (-not $j) { return }
+    if (-not $j.Async.IsCompleted) {
+        $lblAdCache.Text = "AD yukleniyor: $([System.AppDomain]::CurrentDomain.GetData('ClientTool.AdLoadStatus'))  ($([int]((Get-Date) - $j.Start).TotalSeconds) sn)"
+        return
     }
-    finally {
-        $form.Cursor = [System.Windows.Forms.Cursors]::Default
-        $btnAdCache.Enabled = $true
+    $r = Complete-Job $j
+    $script:AdLoadJob = $null
+    $btnAdCache.Enabled = $true
+    $res = @($r.Out | Where-Object { $_ -and $_.PSObject.Properties['Data'] })
+    $old = $script:AdData
+    $new = @(); $done = @(); $errs = @()
+    foreach ($x in $res) {
+        if ($x.Ok) { $new += $x.Data; $done += "{0}: {1:N0} ({2} sn)" -f $x.Domain, @($x.Data).Count, $x.Seconds }
+        else {
+            $errs += "$($x.Domain) [$($x.OU)]: $($x.Error)"; $done += "$($x.Domain): HATA"
+            if ($old) { $new += $old.Where({ ([string]$_.DistinguishedName).EndsWith($x.OU, [System.StringComparison]::OrdinalIgnoreCase) }) }
+        }
     }
+    if ($r.Err -and $res.Count -eq 0) { $errs += $r.Err }   # or. AD modulu yuklenemedi
+    if ($res.Count -gt 0 -and @($res | Where-Object { $_.Ok }).Count -gt 0) { $script:AdData = $new; $script:AdDataTime = Get-Date }
     Update-AdCacheLabel
-    $msg = "AD verisi: {0}/{1} OU basarili, {2:N0} makine ({3} sn) | {4}" -f ($src.Count - $errs.Count), $src.Count, $script:AdData.Count, [int]$sw.Elapsed.TotalSeconds, ($done -join ' | ')
+    Update-AdColumns
+    $msg = "AD verisi: {0}/{1} OU basarili, {2:N0} makine ({3} sn) | {4}" -f @($res | Where-Object { $_.Ok }).Count, @($script:AdCacheSources).Count, @($script:AdData).Count, [int]((Get-Date) - $j.Start).TotalSeconds, ($done -join ' | ')
     $lblStatus.ForeColor = $(if ($errs.Count) { [System.Drawing.Color]::DarkOrange } else { [System.Drawing.Color]::DarkGreen })
     $lblStatus.Text = $msg
-    Write-ActionLog -Hostname '-' -Action 'AD verisi yukleme' -State $(if ($errs.Count -eq $src.Count) { 'fail' } elseif ($errs.Count) { 'warn' } else { 'ok' }) -Text $msg
+    Write-ActionLog -Hostname '-' -Action 'AD verisi yukleme' -State $(if (-not @($res | Where-Object { $_.Ok }).Count) { 'fail' } elseif ($errs.Count) { 'warn' } else { 'ok' }) -Text $msg
     if ($errs.Count -gt 0) {
         [System.Windows.Forms.MessageBox]::Show("Bazi OU'lar alinamadi (onceki verileri korundu):`n`n" + ($errs -join "`n`n"), 'AD Verisi', 'OK', 'Warning') | Out-Null
+    }
+}
+
+function Update-AdColumns {
+    # Yukleme bitince iki tablodaki mevcut satirlarin AD kolonlari $AdData'dan yeniden doldurulur
+    # (yukleme surerken yapilan kontrollerde 'Yukleniyor' yazan hucreler duzelir).
+    foreach ($row in @($script:ResultsTable.Rows)) {
+        $h = [string]$row['Hostname']; if (-not $h) { continue }
+        $a = Get-AdComputerInfo -ComputerName $h
+        if ([string]$row['AdStatus'] -ne $script:PendingText) { $row['AdStatus'] = $a.Status; $row['LastLogon'] = $a.LastLogon }
+    }
+    $seen = New-NameMap
+    foreach ($row in @($script:ParseTable.Rows)) {
+        $h = [string]$row['Hostname']
+        if (-not $h -or $seen.ContainsKey($h) -or [string]$row['AD_Durumu'] -eq '' -or [string]$row['AD_Durumu'] -eq $script:PendingText) { continue }
+        $seen[$h] = 1
+        $a = Get-AdComputerInfo -ComputerName $h
+        Set-ParserCheckValues -HostName $h -Values @{ AD_Durumu = $a.Status; AD_LastLogon = $a.LastLogon }
     }
 }
 
@@ -1635,7 +1668,7 @@ function Show-AdCacheDialog {
     [void]$dlg.ShowDialog($form)
     $doUpdate = ($dlg.Tag -eq 'update')
     $dlg.Dispose()
-    if ($doUpdate) { Start-AdLoad }   # pencere kapandiktan sonra
+    if ($doUpdate) { Start-AdLoad }   # pencere kapandiktan sonra, arka planda
 }
 
 
@@ -3283,7 +3316,7 @@ $script:ParseTable.Add_RowDeleted({ $script:SumDirty[2] = $true })
 $script:ParseTable.Add_TableCleared({ $script:DirtyRows.Clear(); $script:SumDirty[2] = $true })
 $script:SummaryTimer = New-Object System.Windows.Forms.Timer
 $script:SummaryTimer.Interval = 500
-$script:SummaryTimer.Add_Tick({ foreach ($p in 1, 2) { if ($script:SumDirty[$p]) { Update-SummaryNow -Panel $p } } })
+$script:SummaryTimer.Add_Tick({ foreach ($p in 1, 2) { if ($script:SumDirty[$p]) { Update-SummaryNow -Panel $p } }; Update-AdLoad })
 $script:SummaryTimer.Start()
 
 # V13: otomatik yenileme zamanlayicisi
@@ -3601,6 +3634,7 @@ $form.Add_FormClosing({
     Save-Settings
     if ($script:RunTimer.Enabled) { $script:RunTimer.Stop() }
     $script:SummaryTimer.Stop(); $script:AutoTimer.Stop()
+    if ($script:AdLoadJob) { try { [void]$script:AdLoadJob.PS.BeginStop($null, $null) } catch { } }
     foreach ($pf in @($script:Prefetch)) { try { [void]$pf.Job.PS.BeginStop($null, $null) } catch { } }
     # Calisan isler beklenmeden durdurulur (asenkron; uzun WMI cagrisi pencerenin kapanmasini geciktirmesin)
     foreach ($st in @($script:ActiveRuns)) { foreach ($j in $st.Jobs) { if (-not $j.Done) { try { [void]$j.PS.BeginStop($null, $null) } catch { } } } }
@@ -3613,5 +3647,5 @@ $form.Add_FormClosing({
 
 Import-Settings
 Update-AdCacheLabel
-$form.Add_Shown({ Start-AdLoad })   # acilista AD verisi yuklenir (pencere gorundukten sonra)
+$form.Add_Shown({ Start-AdLoad })   # acilista AD verisi arka planda yuklenir
 [void]$form.ShowDialog()
