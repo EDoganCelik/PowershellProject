@@ -25,7 +25,7 @@
               SERVISLER (1. bolumdeki liste), CcmExec ve SCCM kaydi kontrol edilir. Filtre, Excel, CSV.
     Tablolar: hucre secilebilir; Ctrl+C secili hucre(ler)i kopyalar, sag tik menusunde diger kopyalama secenekleri.
 
-    AD ONBELLEGI: AD bilgisi diskteki CSV'den okunur (ServiceStatus\AdComputerCache.csv); "AD Onbellegi..." penceresinde
+    AD ONBELLEGI: AD bilgisi diskteki CSV'lerden okunur (ServiceStatus\AdCache\, OU basina bir dosya); "AD Onbellegi..." penceresinde
     domain -> OU eslemesi girilir, "Kaydet ve Onbellegi Guncelle" ile OU'lar (alt OU dahil) AD'den taranir.
     Onbellek sadece kullanici isterse guncellenir. Last Logon = lastLogonTimestamp (~14 gun gecikmeli).
 
@@ -41,7 +41,7 @@
     - Hedeflerde yerel admin (servis + root\ccm), RPC/DCOM erisimi; SCCM'de onayli script + "Run Script" yetkisi
 
 .KAYITLAR  (%USERPROFILE%\Desktop\ServiceStatus\)
-    ClientToolSettings.json (ayarlar) | AdComputerCache.csv (AD onbellegi) | ClientTool_yyyyMM.log (denetim kaydi)
+    ClientToolSettings.json (ayarlar) | AdCache\*.csv (AD onbellegi, OU basina) | ClientTool_yyyyMM.log (denetim kaydi)
 #>
 
 # WinForms ve pano (Ctrl+C) STA ister; Get-WmiObject sadece Windows PowerShell 5.1'de var.
@@ -92,6 +92,10 @@ $script:RetryButtons   = @{}
 $script:SumDirty       = @{ 1 = $true; 2 = $true }
 $script:DirtyRows      = New-Object 'System.Collections.Generic.HashSet[object]'   # V7: Durum'u yeniden hesaplanacak Panel 2 satirlari
 $script:Auto           = @{}          # V13: panel -> otomatik yenileme ayarlari
+$script:AdProgress     = $null        # AD onbellek guncelleme ilerlemesi (senkronize hashtable; worker'lar yazar)
+$script:AdProgOrder    = @()
+$script:AdSaveSummary  = ''
+$script:AdStart        = $null
 $script:SccmExtra      = New-NameMap  # kisa ad -> @(Boundary Group(s), Operating System Build) (son toplu SCCM sorgusundan)
 $script:ReportQueue    = New-Object System.Collections.ArrayList   # gosterilmeyi bekleyen servis baslatma raporlari
 $script:ShowingReport  = $false
@@ -407,69 +411,102 @@ function Write-FastCsv {
     finally { $w.Dispose() }
 }
 
-function Get-AdCacheIndex {
-    # AD onbellek CSV'sini (Hostname;Domain;Enabled;LastLogonTimestamp;DistinguishedName;CacheTime) okuyup
-    # kisa ad -> string[] satir haritasi dondurur. Dosya yolu $env:CLIENTTOOL_ADCACHE_FILE (process geneli).
-    # PERFORMANS: harita AppDomain'de TEK kopya tutulur; 10 runspace + UI ayni veriyi paylasir, CSV sadece dosya
-    # degisince (LastWriteTime) ve sadece BIR kez okunur (kilitli). Okuma Read-FastCsv ile (Import-Csv degil).
-    $r = [pscustomobject]@{ Ok = $false; Error = ''; Map = $null; Dup = $null; Count = 0; Time = $null }
+function Get-AdCacheFileName {
+    # OU basina onbellek dosya adi: <domain>_<OU ilk adi>_<SHA256 ilk 8>.csv (uzun DN'ler icin kisa, kararli ad)
+    param([string]$Domain, [string]$OU)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $h = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$Domain|$OU".ToLowerInvariant()))[0..3] | ForEach-Object { $_.ToString('x2') }) }
+    finally { $sha.Dispose() }
+    $first = if ($OU -match '^(?:OU|CN)=([^,]+)') { $Matches[1] } else { 'OU' }
+    return (("{0}_{1}_{2}.csv" -f $Domain, $first, $h) -replace '[\\/:*?"<>|\s]', '_')
+}
 
-    $file = [string]$env:CLIENTTOOL_ADCACHE_FILE
-    if (-not $file) { $r.Error = 'AD onbellek dosya yolu tanimli degil'; return $r }
-    if (-not (Test-Path -LiteralPath $file)) {
-        $r.Error = "AD onbellegi bulunamadi ($file). 'AD Onbellegini Guncelle' ile olusturun."
-        return $r
-    }
-    $stamp = [System.IO.File]::GetLastWriteTimeUtc($file)
-    $ad    = [System.AppDomain]::CurrentDomain
-    $lock  = $ad.GetData('ClientTool.AdCacheLock')
+function ConvertTo-LastLogon {
+    # lastLogonTimestamp: ham FileTime (yeni onbellek) veya 'yyyy-MM-dd HH:mm:ss' (eski onbellek) -> DateTime / $null
+    param([string]$Value)
+    if (-not $Value) { return $null }
+    $n = 0L
+    if ([long]::TryParse($Value, [ref]$n)) { if ($n -gt 0 -and $n -lt [long]::MaxValue) { try { return [DateTime]::FromFileTime($n) } catch { } }; return $null }
+    try { return [DateTime]::ParseExact($Value, 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) } catch { return $null }
+}
+
+function ConvertTo-DomainFromDn {
+    # CN=PC1,OU=X,DC=dom1,DC=local -> dom1.local
+    param([string]$Dn)
+    return ((@([regex]::Matches($Dn, '(?i)DC=([^,]+)') | ForEach-Object { $_.Groups[1].Value })) -join '.')
+}
+
+function Get-AdCacheIndex {
+    # AD onbellegi: AdCache klasorundeki OU dosyalari (her OU icin bir CSV: Name;Enabled;LastLogonTimestamp;DistinguishedName,
+    # Get-ADComputer ciktisi DONUSTURULMEDEN yazilir). Doner: kisa ad -> @(DistinguishedName, Enabled, LastLogonTimestamp ham).
+    # Domain DN'den, LastLogon FileTime'dan SADECE bakilan makine icin cevrilir (ConvertTo-LastLogon) - yazarken satir isleme yok.
+    # Harita AppDomain'de TEK kopya (10 runspace + UI paylasir); dosyalar degisince (ad + LastWriteTime) bir kez yeniden okunur.
+    # Eski tek dosyali onbellek (AdComputerCache.csv) klasor bossa okunur.
+    $r = [pscustomobject]@{ Ok = $false; Error = ''; Map = $null; Dup = $null; Count = 0; Unique = 0; Files = 0; Time = $null }
+
+    $dir = [string]$env:CLIENTTOOL_ADCACHE_DIR
+    $files = @()
+    if ($dir -and [System.IO.Directory]::Exists($dir)) { $files = @([System.IO.Directory]::GetFiles($dir, '*.csv')) }
+    if ($files.Count -eq 0 -and $env:CLIENTTOOL_ADCACHE_FILE -and [System.IO.File]::Exists($env:CLIENTTOOL_ADCACHE_FILE)) { $files = @($env:CLIENTTOOL_ADCACHE_FILE) }
+    if ($files.Count -eq 0) { $r.Error = "AD onbellegi bulunamadi ($dir). 'AD Onbellegi...' > 'Kaydet ve Onbellegi Guncelle' ile olusturun."; return $r }
+
+    $stamp = (@($files | Sort-Object | ForEach-Object { "$_|$([System.IO.File]::GetLastWriteTimeUtc($_).Ticks)" }) -join ';')
+    $ad   = [System.AppDomain]::CurrentDomain
+    $lock = $ad.GetData('ClientTool.AdCacheLock')
     if ($lock) { [System.Threading.Monitor]::Enter($lock) }
     try {
         $mem = $ad.GetData('ClientTool.AdCache')
-        if (-not ($mem -and $mem.File -eq $file -and $mem.Stamp -eq $stamp)) {
-            # Guncelleme sirasinda dosya o an degisiyor olabilir: birkac kez dene
-            $csv = $null
-            for ($try = 0; $try -lt 3 -and $null -eq $csv; $try++) {
-                try { $csv = Read-FastCsv -Path $file } catch { Start-Sleep -Milliseconds 300 }
-            }
-            if ($null -eq $csv) {
-                if (-not ($mem -and $mem.File -eq $file)) { $r.Error = "AD onbellegi okunamadi: $file"; return $r }   # eldeki eski veriyle devam
-            }
-            else {
-                # Kolonlar ADIYLA bulunur (eski / farkli sirali dosyalar da okunur)
+        if (-not ($mem -and $mem.Stamp -eq $stamp)) {
+            $map = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)   # tr-TR I/i
+            $dup = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+            $count = 0; $latest = [datetime]::MinValue; $bad = @()
+            foreach ($f in $files) {
+                $csv = $null
+                for ($try = 0; $try -lt 3 -and $null -eq $csv; $try++) { try { $csv = Read-FastCsv -Path $f } catch { Start-Sleep -Milliseconds 300 } }
+                if ($null -eq $csv) { $bad += $f; continue }
+                $t = [System.IO.File]::GetLastWriteTime($f); if ($t -gt $latest) { $latest = $t }
                 $ix = @{}
                 for ($i = 0; $i -lt $csv.Header.Count; $i++) { $ix[$csv.Header[$i]] = $i }
-                $iH = $ix['Hostname']; $iD = $ix['Domain']; $iE = $ix['Enabled']; $iL = $ix['LastLogonTimestamp']
-                # tr-TR'de I/i sorunu olmamasi icin OrdinalIgnoreCase. Deger: @(Domain, Enabled, LastLogon)
-                $map = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
-                $dup = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
-                foreach ($f in $csv.Rows) {
-                    if ($f.Length -le $iL) { continue }
-                    $k = $f[$iH].Trim()
+                $iN = if ($ix.ContainsKey('Name')) { $ix['Name'] } else { $ix['Hostname'] }   # eski tek dosya: Hostname
+                $iE = $ix['Enabled']; $iL = $ix['LastLogonTimestamp']; $iD = $ix['DistinguishedName']
+                if ($null -eq $iN -or $null -eq $iE -or $null -eq $iL -or $null -eq $iD) { $bad += $f; continue }
+                $need = [Math]::Max([Math]::Max($iN, $iE), [Math]::Max($iL, $iD))
+                foreach ($x in $csv.Rows) {
+                    if ($x.Length -le $need) { continue }
+                    $k = $x[$iN]
                     if (-not $k) { continue }
-                    $v = [string[]]@($f[$iD], $f[$iE], $f[$iL])
+                    $count++
+                    $v = [string[]]@($x[$iD], $x[$iE], $x[$iL])
                     $prev = $map[$k]
                     if ($null -eq $prev) { $map[$k] = $v; continue }
-                    # Ayni isim birden fazla domain'de: en yeni lastLogonTimestamp'li kayit kullanilir
-                    $dup[$k] = if ($dup.ContainsKey($k)) { "$($dup[$k]), $($v[0])" } else { "$($prev[0]), $($v[0])" }
-                    if ([string]::CompareOrdinal($v[2], $prev[2]) -gt 0) { $map[$k] = $v }
+                    if ($prev[0] -eq $v[0]) { continue }   # ic ice OU: ayni hesap iki kez
+                    # Ayni isim birden fazla domain'de (nadir): en yeni lastLogon'lu kayit kullanilir
+                    $dup[$k] = 1
+                    $a = ConvertTo-LastLogon $v[2]; $b = ConvertTo-LastLogon $prev[2]
+                    if ($a -and (-not $b -or $a -gt $b)) { $map[$k] = $v }
                 }
-                $mem = [pscustomobject]@{ File = $file; Stamp = $stamp; Map = $map; Dup = $dup; Count = $csv.Rows.Count; Time = $stamp.ToLocalTime() }
-                $ad.SetData('ClientTool.AdCache', $mem)
             }
+            if ($map.Count -eq 0 -and $bad.Count -gt 0) {
+                if ($mem) { $r.Ok = $true; $r.Map = $mem.Map; $r.Dup = $mem.Dup; $r.Count = $mem.Count; $r.Unique = $mem.Map.Count; $r.Files = $mem.Files; $r.Time = $mem.Time; return $r }
+                $r.Error = "AD onbellegi okunamadi: $($bad -join ', ')"; return $r
+            }
+            $mem = [pscustomobject]@{ Stamp = $stamp; Map = $map; Dup = $dup; Count = $count; Files = $files.Count; Time = $latest }
+            $ad.SetData('ClientTool.AdCache', $mem)
         }
-        $r.Ok = $true; $r.Map = $mem.Map; $r.Dup = $mem.Dup; $r.Count = $mem.Count; $r.Time = $mem.Time
+        $r.Ok = $true; $r.Map = $mem.Map; $r.Dup = $mem.Dup; $r.Count = $mem.Count; $r.Unique = $mem.Map.Count; $r.Files = $mem.Files; $r.Time = $mem.Time
         return $r
     }
     finally { if ($lock) { [System.Threading.Monitor]::Exit($lock) } }
 }
 
 function Get-AdOuComputers {
-    # Bir domain'in verilen OU'larinin ALTINDAKI (alt OU'lar dahil) bilgisayar hesaplarini AD'den okur.
-    # LIMIT YOK: -ResultSetSize $null = tum sonuclar; -ResultPageSize 1000 sadece sayfa boyutudur (AD'nin varsayilan
-    # MaxPageSize'i da 1000) - cmdlet 1000'erli sayfalarla TUM hesaplari getirir.
-    # PERFORMANS: satirlar PSCustomObject degil string[] (CSV kolon sirasi), List'e eklenir ('+=' yok).
-    param([string]$Domain, [string[]]$SearchBases)
+    # Bir domain'in OU'larini (alt OU'lar dahil) AD'den okur ve HER OU'yu ayri CSV'ye DOGRUDAN yazar:
+    #   $data = Get-ADComputer ... ; $data | Select-Object Name, Enabled, LastLogonTimestamp, DistinguishedName | Export-Csv
+    # Satir satir donusum YOK (LastLogon / domain okurken cevrilir). Dosya once .tmp'ye yazilir, basariliysa yerine tasinir;
+    # hata veren OU'nun ESKI dosyasina dokunulmaz (eski veri kendiliginden korunur).
+    # LIMIT YOK: -ResultSetSize $null; -ResultPageSize 1000 sadece sayfa boyutu.
+    # Ilerleme: $Progress["$Domain [$OU]"] = @(sayi, durum, sn) - durum: okunuyor / yaziliyor / bitti / hata
+    param([string]$Domain, [string[]]$SearchBases, $Progress, [string]$CacheDir)
 
     $items = New-Object System.Collections.ArrayList
     $modErr = ''
@@ -479,30 +516,46 @@ function Get-AdOuComputers {
     }
 
     foreach ($sb in @($SearchBases)) {
-        $it = [pscustomobject]@{ SearchBase = [string]$sb; Ok = $false; Error = ''; Rows = $null }
-        if ($modErr) { $it.Error = $modErr; [void]$items.Add($it); continue }
+        $key = "$Domain [$sb]"
+        $it = [pscustomobject]@{ SearchBase = [string]$sb; Ok = $false; Error = ''; Count = 0; Seconds = 0 }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
         try {
-            $now  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-            $rows = New-Object 'System.Collections.Generic.List[string[]]'
-            foreach ($c in (Get-ADComputer -Filter * -SearchBase $sb -SearchScope Subtree -Server $Domain -ResultSetSize $null -ResultPageSize 1000 `
-                        -Properties @('Enabled', 'LastLogonTimestamp', 'DistinguishedName') -ErrorAction Stop)) {
-                $ll = ''
-                $ft = $c.LastLogonTimestamp
-                if ($ft -is [long] -and $ft -gt 0 -and $ft -lt [long]::MaxValue) { $ll = [DateTime]::FromFileTime($ft).ToString('yyyy-MM-dd HH:mm:ss') }
-                $rows.Add([string[]]@([string]$c.Name, $Domain, [string][bool]$c.Enabled, $ll, [string]$c.DistinguishedName, $now))
+            if ($modErr) { throw $modErr }
+            if ($Progress) { $Progress[$key] = @(0, 'okunuyor', 0) }
+            $data = @(Get-ADComputer -Filter * -SearchBase $sb -SearchScope Subtree -Server $Domain -ResultSetSize $null -ResultPageSize 1000 `
+                    -Properties Enabled, LastLogonTimestamp -ErrorAction Stop)
+            $it.Count = $data.Count
+            if ($Progress) { $Progress[$key] = @($data.Count, 'yaziliyor', [int]$sw.Elapsed.TotalSeconds) }
+
+            $file = Join-Path $CacheDir (Get-AdCacheFileName -Domain $Domain -OU $sb)
+            $tmp  = "$file.tmp"
+            if ($data.Count -gt 0) {
+                $data | Select-Object Name, Enabled, LastLogonTimestamp, DistinguishedName |
+                    Export-Csv -LiteralPath $tmp -NoTypeInformation -Delimiter ';' -Encoding UTF8 -ErrorAction Stop
             }
-            $it.Rows = $rows
+            else { Set-Content -LiteralPath $tmp -Value '"Name";"Enabled";"LastLogonTimestamp";"DistinguishedName"' -Encoding UTF8 -ErrorAction Stop }
+            # Okuyan bir runspace dosyayi o an acik tutuyorsa tasima basarisiz olabilir: birkac kez dene
+            for ($try = 1; ; $try++) {
+                try { Move-Item -LiteralPath $tmp -Destination $file -Force -ErrorAction Stop; break }
+                catch { if ($try -ge 10) { throw }; Start-Sleep -Milliseconds 300 }
+            }
             $it.Ok = $true
+            $it.Seconds = [int]$sw.Elapsed.TotalSeconds
+            if ($Progress) { $Progress[$key] = @($data.Count, 'bitti', $it.Seconds) }
         }
-        catch { $it.Error = "AD sorgusu basarisiz: $($_.Exception.Message)" }
+        catch {
+            $it.Error = "AD sorgusu / yazma basarisiz: $($_.Exception.Message)"
+            $it.Seconds = [int]$sw.Elapsed.TotalSeconds
+            if ($Progress) { $Progress[$key] = @($it.Count, 'hata', $it.Seconds) }
+        }
         [void]$items.Add($it)
     }
     return [pscustomobject]@{ Domain = $Domain; Items = $items }
 }
 
 function Get-AdComputerInfo {
-    # AD bilgisini AD'ye SORGU ATMADAN onbellekten okur (Get-AdCacheIndex; harita degeri: Domain, Enabled, LastLogon).
-    # Status: Enabled / Disabled / Bulunamadi / Sorgulanamadi. LastLogon: lastLogonTimestamp (~14 gun gecikmeli).
+    # AD bilgisini AD'ye SORGU ATMADAN onbellekten okur. Status: Enabled / Disabled / Bulunamadi / Sorgulanamadi.
+    # LastLogon: lastLogonTimestamp (~14 gun gecikmeli) - ham FileTime burada cevrilir.
     param([string]$ComputerName)
 
     $res = [pscustomobject]@{ Status = 'Bulunamadi'; LastLogon = 'N/A'; Detail = '' }
@@ -512,16 +565,13 @@ function Get-AdComputerInfo {
     $short = (([string]$ComputerName -split '\.')[0]).Trim()
     $v = $idx.Map[$short]
     if ($null -eq $v) {
-        $res.Detail = "AD onbellegindeki OU'larda bulunamadi (onbellek: $($idx.Time.ToString('yyyy-MM-dd HH:mm')), $($idx.Count) kayit)"
+        $res.Detail = "AD onbellegindeki OU'larda bulunamadi (onbellek: $($idx.Time.ToString('yyyy-MM-dd HH:mm')), $($idx.Unique) makine)"
         return $res
     }
-    if ($idx.Dup.ContainsKey($short)) { $res.Detail = "Birden fazla domain'de bulundu ($($idx.Dup[$short])); en yeni lastLogon'a sahip kayit kullanildi" }
+    if ($idx.Dup.ContainsKey($short)) { $res.Detail = "Birden fazla domain'de bulundu; en yeni lastLogon'a sahip kayit kullanildi ($(ConvertTo-DomainFromDn $v[0]))" }
     $res.Status = if ($v[1] -eq 'True') { 'Enabled' } else { 'Disabled' }
-    $res.LastLogon = 'Hic'
-    if ($v[2]) {
-        try { $res.LastLogon = [DateTime]::ParseExact($v[2], 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture).ToString('yyyy-MM-dd HH:mm') }
-        catch { }
-    }
+    $t = ConvertTo-LastLogon $v[2]
+    $res.LastLogon = if ($t) { $t.ToString('yyyy-MM-dd HH:mm') } else { 'Hic' }
     return $res
 }
 
@@ -1001,7 +1051,7 @@ function New-WorkerScript {
     # Ortak fonksiyonlarin kaynak kodunu worker scriptinin basina gomer; tanimlar TEK yerde tutulur.
     param([string]$ParamLine, [string]$CallLine, [string[]]$Funcs)
     $all = @('ConvertTo-WqlString', 'Get-ErrText', 'Test-Ping', 'Test-TcpPort', 'Get-NetBiosName', 'Get-WmiFailureReason', 'Get-WmiComputerName',
-        'Get-DnsWildcardIps', 'Resolve-HostDns', 'Get-HostReach', 'Read-FastCsv', 'Get-AdCacheIndex', 'Get-AdOuComputers', 'Get-AdComputerInfo', 'Get-ServiceCheck',
+        'Get-DnsWildcardIps', 'Resolve-HostDns', 'Get-HostReach', 'Read-FastCsv', 'Get-AdCacheFileName', 'ConvertTo-LastLogon', 'ConvertTo-DomainFromDn', 'Get-AdCacheIndex', 'Get-AdOuComputers', 'Get-AdComputerInfo', 'Get-ServiceCheck',
         'Get-RemoteStatus', 'Start-RemoteFix', 'Invoke-SccmClientAction', 'Get-NoResponseVerdict', 'Get-SccmDevice', 'Send-SccmScript',
         'Get-AdStructureStatus', 'New-SkippedScript', 'Invoke-ScriptWithAdCheck', 'Get-SccmRegistration', 'Get-ParserHostCheck', 'Invoke-ParserScriptRun')
     $defs = foreach ($n in $(if ($Funcs) { $Funcs } else { $all })) { "function $n {`n$((Get-Item -Path "function:$n").ScriptBlock.ToString())`n}" }
@@ -1013,7 +1063,7 @@ $script:FixWorker          = New-WorkerScript '$ComputerName, $ServiceDetail' 'S
 $script:ActionWorker       = New-WorkerScript '$ComputerName, $ActionName, $ScheduleIds' 'Invoke-SccmClientAction -ComputerName $ComputerName -ActionName $ActionName -ScheduleIds $ScheduleIds'
 $script:ScriptWorker       = New-WorkerScript '$ComputerName, $SmsProvider, $SiteCode, $ScriptGuid, $ScriptName, $ParamB64, $TimeoutSec, $ServiceNames, $SccmInfo' 'Invoke-ScriptWithAdCheck -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -ScriptGuid $ScriptGuid -ScriptName $ScriptName -ParamB64 $ParamB64 -TimeoutSec $TimeoutSec -ServiceNames $ServiceNames -SccmInfo $SccmInfo'
 $script:AdWorker           = New-WorkerScript '$ComputerName' 'Get-AdStructureStatus -ComputerName $ComputerName'
-$script:AdCacheWorker      = New-WorkerScript '$Domain, $SearchBases' 'Get-AdOuComputers -Domain $Domain -SearchBases $SearchBases' @('Get-AdOuComputers')
+$script:AdCacheWorker      = New-WorkerScript '$Domain, $SearchBases, $Progress, $CacheDir' 'Get-AdOuComputers -Domain $Domain -SearchBases $SearchBases -Progress $Progress -CacheDir $CacheDir' @('Get-AdCacheFileName', 'Get-AdOuComputers')
 $script:ParserCheckWorker  = New-WorkerScript '$ComputerName, $SmsProvider, $SiteCode, $ServiceNames, $SccmInfo' 'Get-ParserHostCheck -ComputerName $ComputerName -SmsProvider $SmsProvider -SiteCode $SiteCode -ServiceNames $ServiceNames -SccmInfo $SccmInfo'
 $script:VerdictWorker      = New-WorkerScript '$ComputerName, $TimeoutSec' 'Get-NoResponseVerdict -ComputerName $ComputerName -TimeoutSec $TimeoutSec'
 $script:PollWorker         = New-WorkerScript '$Items' 'Get-ScriptPollStatus -Items $Items' @('ConvertTo-WqlString', 'Select-ScriptStatusRow', 'Get-ScriptPollStatus')
@@ -1050,11 +1100,17 @@ function Get-DataDir {
 }
 
 function Get-SettingsFile { return (Join-Path (Get-DataDir) 'ClientToolSettings.json') }
-function Get-AdCacheFile  { return (Join-Path (Get-DataDir) 'AdComputerCache.csv') }
+function Get-AdCacheFile  { return (Join-Path (Get-DataDir) 'AdComputerCache.csv') }   # ESKI tek dosyali onbellek (sadece gecis icin okunur)
+function Get-AdCacheDir {
+    $d = Join-Path (Get-DataDir) 'AdCache'   # OU basina bir CSV
+    if (-not (Test-Path -LiteralPath $d)) { $null = New-Item -ItemType Directory -Path $d -Force }
+    return $d
+}
 
 # Paralel runspace'ler script degiskenlerini goremez; onbellek yolunu process geneli ortam degiskeniyle paylasiriz
 # (Get-AdCacheIndex bu degiskeni okur).
 $env:CLIENTTOOL_ADCACHE_FILE = Get-AdCacheFile
+$env:CLIENTTOOL_ADCACHE_DIR  = Get-AdCacheDir
 # AD onbellek haritasi tum runspace'lerde TEK kopya (AppDomain); ayni anda tek runspace yukler
 if (-not [System.AppDomain]::CurrentDomain.GetData('ClientTool.AdCacheLock')) { [System.AppDomain]::CurrentDomain.SetData('ClientTool.AdCacheLock', (New-Object System.Object)) }
 
@@ -1418,6 +1474,7 @@ $script:RunTimer.Add_Tick({
         }
         $w = Get-RunWaitCount $st
         $txt = "$($st.Title): $($st.Done) / $($st.Total) tamamlandi (ayni anda en fazla $($script:MaxParallel) istek)"
+        if ($st.Unit -eq 'domain') { $txt = "AD onbellek guncelleme ($([int]((Get-Date) - $script:AdStart).TotalSeconds) sn)  |  $(Format-AdProgress)" }
         if ($w -gt 0) {
             $txt += "  |  $w cihazin script sonucu bekleniyor (toplu yoklama: 4 sn'de bir tek sorgu, $($script:PollCount). tur)"
             if ($script:PollError) { $txt += "  |  Son yoklama hatasi: $($script:PollError)" }
@@ -1426,7 +1483,7 @@ $script:RunTimer.Add_Tick({
         if (-not $pending -and $w -eq 0) {
             [void]$script:ActiveRuns.Remove($st)
             if ($st.Report -and $st.Report.Count -gt 0) { [void]$script:ReportQueue.Add($st) }
-            $lbl.Text = "$($st.Title) tamamlandi. $($st.Total) $($st.Unit) islendi."
+            $lbl.Text = if ($st.Unit -eq 'domain' -and $script:AdSaveSummary) { $script:AdSaveSummary } else { "$($st.Title) tamamlandi. $($st.Total) $($st.Unit) islendi." }
             Set-UiBusy -Panel $st.Panel -Busy $false
             if ($st.Panel -eq 2) { Update-ParserInfo }
         }
@@ -1599,12 +1656,71 @@ function Update-GridFromAd {
 
 # ---------- AD onbellegi (CSV) guncelleme (UI thread'i) ----------
 
+function Update-AdCacheFromWorker {
+    # Her domain'in sonucu geldikce toplanir; hepsi gelince ozet (dosyalar worker'larda zaten yazildi).
+    param($Key, $Output, $ErrorText)
+
+    $r = @($Output | Where-Object { $_ -and $_.PSObject.Properties['Items'] -and $_.PSObject.Properties['Domain'] })[0]
+    if (-not $r) {
+        # Is hic sonuc donmedi: bu domain'in tum OU'lari basarisiz sayilir
+        $fail = foreach ($s in @($script:AdCacheSources | Where-Object { $_.Domain -eq $Key })) {
+            [pscustomobject]@{ SearchBase = [string]$s.OU; Ok = $false; Error = (Format-JobError $ErrorText); Count = 0; Seconds = 0 }
+        }
+        $r = [pscustomobject]@{ Domain = [string]$Key; Items = @($fail) }
+    }
+    $script:AdCacheNew[[string]$Key] = $r
+
+    $domains = @($script:AdCacheSources | Group-Object -Property Domain).Count   # buyuk/kucuk harf duyarsiz
+    if ($script:AdCacheNew.Count -ge $domains) { Complete-AdCacheUpdate }
+}
+
+function Complete-AdCacheUpdate {
+    # Tum domain'ler bitti: ozet + artik tanimli olmayan OU dosyalarinin temizligi + etiket. Birlestirme / yeniden yazma YOK.
+    $dir = Get-AdCacheDir
+    $okCount = 0; $total = 0
+    $parts    = New-Object 'System.Collections.Generic.List[string]'
+    $problems = New-Object 'System.Collections.Generic.List[string]'
+    $keep     = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($s in @($script:AdCacheSources)) {
+        $dom = [string]$s.Domain; $ou = [string]$s.OU
+        [void]$keep.Add((Get-AdCacheFileName -Domain $dom -OU $ou))
+        $r = $null
+        $dr = $script:AdCacheNew[$dom]
+        if ($dr) { foreach ($x in $dr.Items) { if ($x.SearchBase -eq $ou) { $r = $x; break } } }
+        if ($r -and $r.Ok) { $okCount++; $total += $r.Count; $parts.Add(("{0} [{1}]: {2:N0} ({3} sn)" -f $dom, $ou, $r.Count, $r.Seconds)) }
+        else {
+            $why = if ($r -and $r.Error) { $r.Error } else { 'sonuc alinamadi' }
+            $old = Join-Path $dir (Get-AdCacheFileName -Domain $dom -OU $ou)
+            $problems.Add("${dom} [$ou]: $why`n   ($(if (Test-Path -LiteralPath $old) { 'eski dosya korundu' } else { 'bu OU icin onbellek yok' }))")
+        }
+    }
+    # Ayarlardan cikarilmis OU'larin dosyalari (ve yarim kalmis .tmp'ler) silinir; hepsi basariliysa eski tek dosya da.
+    foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue)) {
+        if ($f.Extension -eq '.tmp' -or ($f.Extension -eq '.csv' -and -not $keep.Contains($f.Name))) { try { Remove-Item -LiteralPath $f.FullName -Force } catch { } }
+    }
+    if ($okCount -eq @($script:AdCacheSources).Count -and (Test-Path -LiteralPath (Get-AdCacheFile))) { try { Remove-Item -LiteralPath (Get-AdCacheFile) -Force } catch { } }
+
+    $idx  = Get-AdCacheIndex
+    $secs = if ($script:AdStart) { [int]((Get-Date) - $script:AdStart).TotalSeconds } else { 0 }
+    $uniq = if ($idx.Ok) { $idx.Unique } else { 0 }
+    $script:AdSaveSummary = ("AD onbellegi guncellendi ({0} sn): AD'den {1:N0} kayit okundu, onbellekte {2:N0} tekil makine | {3}/{4} OU basarili | {5}" -f
+        $secs, $total, $uniq, $okCount, @($script:AdCacheSources).Count, ($parts -join ' | '))
+    if ($okCount -eq 0) { $script:AdSaveSummary = "AD onbellegi GUNCELLENMEDI: hicbir OU'dan veri alinamadi (mevcut dosyalar korundu)." }
+    Update-AdCacheLabel
+    $state = if ($okCount -eq 0) { 'fail' } elseif ($problems.Count -gt 0) { 'warn' } else { 'ok' }
+    Write-ActionLog -Hostname '-' -Action 'AD onbellek guncelleme' -State $state -Text ((@($script:AdSaveSummary) + @($problems)) -join ' | ')
+    if ($problems.Count -gt 0) {
+        $title = if ($okCount -eq 0) { "Hicbir OU'dan veri alinamadi; mevcut onbellek DEGISTIRILMEDI." } else { "Onbellek guncellendi ancak bazi OU'lar alinamadi:" }
+        [System.Windows.Forms.MessageBox]::Show("$title`n`n" + ($problems -join "`n`n"), 'AD Onbellegi', 'OK', $(if ($okCount -eq 0) { 'Error' } else { 'Warning' })) | Out-Null
+    }
+}
+
 function Update-AdCacheLabel {
-    # Onbellek durumunu (kayit sayisi + son guncelleme zamani) kontrol grubundaki etikete yazar.
+    # Onbellek durumunu (tekil makine + kayit + son guncelleme zamani) kontrol grubundaki etikete yazar.
     $idx = Get-AdCacheIndex
     if ($idx.Ok) {
         $age  = ((Get-Date) - $idx.Time).TotalDays
-        $text = "Onbellek: $($idx.Count) kayit | $($idx.Time.ToString('yyyy-MM-dd HH:mm'))"
+        $text = "Onbellek: {0:N0} makine ({1} dosya) | {2}" -f $idx.Unique, $idx.Files, $idx.Time.ToString('yyyy-MM-dd HH:mm')
         if ($age -gt 7) { $text += ' (eski)' }
         $lblAdCache.Text      = $text
         $lblAdCache.ForeColor = $(if ($age -gt 7) { [System.Drawing.Color]::DarkOrange } else { [System.Drawing.Color]::DimGray })
@@ -1676,7 +1792,7 @@ function Show-AdCacheDialog {
     foreach ($s in @($script:AdCacheSources)) { [void]$grid.Rows.Add([string]$s.Domain, [string]$s.OU) }
 
     $idx = Get-AdCacheIndex
-    $info = if ($idx.Ok) { "Mevcut onbellek: $($idx.Count) kayit, son guncelleme $($idx.Time.ToString('yyyy-MM-dd HH:mm'))`n$(Get-AdCacheFile)" } else { "Mevcut onbellek yok.`n$(Get-AdCacheFile)" }
+    $info = if ($idx.Ok) { "Mevcut onbellek: $($idx.Unique) makine ($($idx.Files) dosya), son guncelleme $($idx.Time.ToString('yyyy-MM-dd HH:mm'))`n$(Get-AdCacheDir)" } else { "Mevcut onbellek yok.`n$(Get-AdCacheDir)" }
     $lblInfo    = New-Ctl Label $info 12 332 820 34 @{ Anchor = 'Bottom,Left,Right'; ForeColor = [System.Drawing.Color]::DimGray }
     $btnSave    = New-Ctl Button 'Kaydet' 12 374 110 30 @{ Anchor = 'Bottom,Left' }
     $btnSaveUpd = New-Ctl Button 'Kaydet ve Onbellegi Guncelle' 130 374 210 30 @{ Anchor = 'Bottom,Left' }
@@ -1704,124 +1820,44 @@ function Show-AdCacheDialog {
     if ($doUpdate) { Start-AdCacheUpdate }   # pencere kapandiktan sonra (arka planda, UI donmaz)
 }
 
+function Format-AdProgress {
+    # Durum cubugu: "Toplam: 25.300 makine okundu (3 OU: 1 bitti, 1 okunuyor, 1 sirada) | dom1 [OU=..]: 12.500 bitti (8 sn) | ..."
+    $p = $script:AdProgress
+    if (-not $p) { return '' }
+    $tot = 0; $st = @{}
+    $parts = foreach ($k in $script:AdProgOrder) {
+        $v = $p[$k]
+        if (-not $v) { continue }
+        $tot += [int]$v[0]
+        $st[$v[1]] = 1 + [int]$st[$v[1]]
+        $ou = ($k -replace '\[(OU|CN)=([^,\]]+)[^\]]*\]', '[$2]')   # durum cubugunda OU'nun sadece ilk adi
+        "{0}: {1:N0} {2}{3}" -f $ou, [int]$v[0], $v[1], $(if ($v[2]) { " ($($v[2]) sn)" } else { '' })
+    }
+    $cnt = (@('bitti', 'yaziliyor', 'okunuyor', 'sirada', 'hata') | Where-Object { $st[$_] } | ForEach-Object { "$($st[$_]) $_" }) -join ', '
+    return ("Toplam: {0:N0} makine okundu ({1} OU: {2})  |  " -f $tot, @($script:AdProgOrder).Count, $cnt) + (@($parts) -join '  |  ')
+}
+
 function Start-AdCacheUpdate {
     # Kullanici isterse: kayitli domain / OU eslemesindeki her OU AD'den taranir ve CSV onbellegi yeniden yazilir.
     # Domain basina TEK is baslatilir; o domain'in OU'lari is icinde sirayla taranir.
+    # Ilerleme: $script:AdProgress (senkronize) -> durum cubugunda OU bazinda canli "N makine okundu".
     $src = @($script:AdCacheSources)
     if ($src.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("Once 'AD Onbellegi...' penceresinden en az bir domain / OU girin.", 'Uyari') | Out-Null
         return
     }
 
-    $script:AdCacheNew = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+    $script:AdCacheNew  = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+    $script:AdProgress  = [hashtable]::Synchronized(@{})
+    $script:AdProgOrder = @($src | ForEach-Object { "$($_.Domain) [$($_.OU)]" })
+    foreach ($k in $script:AdProgOrder) { $script:AdProgress[$k] = @(0, 'sirada', 0) }
+    $script:AdSaveSummary = ''
+    $script:AdStart = Get-Date
     $items = @(foreach ($g in ($src | Group-Object -Property Domain)) {
         $ous = [string[]]@($g.Group | ForEach-Object { [string]$_.OU })
-        [pscustomobject]@{ Key = [string]$g.Name; Params = @{ Domain = [string]$g.Name; SearchBases = $ous } }
+        [pscustomobject]@{ Key = [string]$g.Name; Params = @{ Domain = [string]$g.Name; SearchBases = $ous; Progress = $script:AdProgress; CacheDir = (Get-AdCacheDir) } }
     })
     Start-ParallelRun -Title 'AD onbellek guncelleme' -Worker $script:AdCacheWorker -Items $items -OnResultFn 'Update-AdCacheFromWorker' -Unit 'domain'
-}
-
-function Update-AdCacheFromWorker {
-    # Her domain'in sonucu geldikce toplanir; hepsi gelince CSV yazilir.
-    param($Key, $Output, $ErrorText)
-
-    $r = @($Output | Where-Object { $_ -and $_.PSObject.Properties['Items'] -and $_.PSObject.Properties['Domain'] })[0]
-    if (-not $r) {
-        # Is hic sonuc donmedi: bu domain'in tum OU'lari basarisiz sayilir
-        $fail = foreach ($s in @($script:AdCacheSources | Where-Object { $_.Domain -eq $Key })) {
-            [pscustomobject]@{ SearchBase = [string]$s.OU; Ok = $false; Error = (Format-JobError $ErrorText); Rows = @() }
-        }
-        $r = [pscustomobject]@{ Domain = [string]$Key; Items = @($fail) }
-    }
-    $script:AdCacheNew[[string]$Key] = $r
-
-    $domains = @($script:AdCacheSources | Group-Object -Property Domain).Count   # buyuk/kucuk harf duyarsiz
-    if ($script:AdCacheNew.Count -ge $domains) { Save-AdCache }
-}
-
-function Save-AdCache {
-    # Basarili OU'larin yeni verisini yazar; basarisiz OU'nun ESKI verisini korur (yarim guncelleme veri kaybettirmez).
-    # CSV once gecici dosyaya yazilir, sonra yerine tasinir (calisan sorgular yarim dosya okumasin).
-    # PERFORMANS: Read-FastCsv / Write-FastCsv (Import-Csv / Select-Object / Export-Csv degil), satirlar string[],
-    # eski veri domain'e gore BIR kez gruplanir, tekillestirme hashtable ile, '+=' yok.
-    $file   = Get-AdCacheFile
-    $header = [string[]]@('Hostname', 'Domain', 'Enabled', 'LastLogonTimestamp', 'DistinguishedName', 'CacheTime')
-
-    # Eski veri: domain -> satirlar (sadece basarisiz OU'lar icin gerekir)
-    $oldByDom = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
-    if (Test-Path -LiteralPath $file) {
-        try {
-            $csv = Read-FastCsv -Path $file
-            $ix = @{}
-            for ($i = 0; $i -lt $csv.Header.Count; $i++) { $ix[$csv.Header[$i]] = $i }
-            $order = @($header | ForEach-Object { $ix[$_] })
-            if (@($order | Where-Object { $null -eq $_ }).Count -eq 0) {
-                foreach ($f in $csv.Rows) {
-                    if ($f.Length -lt $header.Count) { continue }
-                    $row = [string[]]@($f[$order[0]], $f[$order[1]], $f[$order[2]], $f[$order[3]], $f[$order[4]], $f[$order[5]])
-                    $l = $oldByDom[$row[1]]
-                    if ($null -eq $l) { $l = New-Object 'System.Collections.Generic.List[string[]]'; $oldByDom[$row[1]] = $l }
-                    $l.Add($row)
-                }
-            }
-        }
-        catch { }
-    }
-
-    $all      = New-Object 'System.Collections.Generic.List[string[]]'
-    $okCount  = 0
-    $problems = New-Object 'System.Collections.Generic.List[string]'
-    $summary  = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($s in @($script:AdCacheSources)) {
-        $dom = [string]$s.Domain
-        $ou  = [string]$s.OU
-        $dr  = $script:AdCacheNew[$dom]
-        $r   = $null
-        if ($dr) { foreach ($x in $dr.Items) { if ($x.SearchBase -eq $ou) { $r = $x; break } } }
-        if ($r -and $r.Ok) {
-            $okCount++
-            if ($r.Rows) { $all.AddRange($r.Rows) }
-            $summary.Add("${dom} [$ou]: $(if ($r.Rows) { $r.Rows.Count } else { 0 }) makine")
-        }
-        else {
-            $n = 0
-            $l = $oldByDom[$dom]
-            if ($l) { foreach ($row in $l) { if ($row[4].EndsWith($ou, [System.StringComparison]::OrdinalIgnoreCase)) { $all.Add($row); $n++ } } }
-            $why = if ($r -and $r.Error) { $r.Error } else { 'sonuc alinamadi' }
-            $problems.Add("${dom} [$ou]: $why`n   (eski veri korundu: $n kayit)")
-        }
-    }
-
-    if ($okCount -eq 0) {
-        Write-ActionLog -Hostname '-' -Action 'AD onbellek guncelleme' -State 'fail' -Text ($problems -join ' | ')
-        [System.Windows.Forms.MessageBox]::Show("Hicbir OU'dan veri alinamadi; mevcut onbellek DEGISTIRILMEDI.`n`n" + ($problems -join "`n`n"), 'AD Onbellegi', 'OK', 'Error') | Out-Null
-        return
-    }
-
-    # Ic ice OU'lar ayni hesabi iki kez getirebilir: DistinguishedName'e gore tekillestir
-    $uniq = New-Object 'System.Collections.Generic.List[string[]]' ($all.Count)
-    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($row in $all) {
-        $k = if ($row[4]) { $row[4] } else { "$($row[1])|$($row[0])" }
-        if ($seen.Add($k)) { $uniq.Add($row) }
-    }
-
-    $tmp = "$file.tmp"
-    try {
-        Write-FastCsv -Path $tmp -Header $header -Rows $uniq
-        Move-Item -LiteralPath $tmp -Destination $file -Force
-    }
-    catch {
-        [System.Windows.Forms.MessageBox]::Show("Onbellek dosyasi yazilamadi:`n`n$($_.Exception.Message)", 'AD Onbellegi', 'OK', 'Error') | Out-Null
-        return
-    }
-
-    Update-AdCacheLabel
-    $state = if ($problems.Count -gt 0) { 'warn' } else { 'ok' }
-    Write-ActionLog -Hostname '-' -Action 'AD onbellek guncelleme' -State $state -Text ((@($summary) + @($problems)) -join ' | ')
-    if ($problems.Count -gt 0) {
-        [System.Windows.Forms.MessageBox]::Show("Onbellek guncellendi ancak bazi OU'lar alinamadi:`n`n" + ($problems -join "`n`n"), 'AD Onbellegi', 'OK', 'Warning') | Out-Null
-    }
 }
 
 # ---------- SCCM yardimcilari (UI thread'i) ----------
