@@ -630,6 +630,17 @@ function Get-WmiChunked {
     return $out
 }
 
+function Test-DirectRule {
+    # Koleksiyon kurali Direct mi? (SMS_CollectionRuleDirect; sadece bu kural tipinde ResourceID alani var)
+    param($Rule)
+    if (-not $Rule) { return $false }
+    $cls = ''
+    try { $cls = [string]$Rule.psbase.ClassPath.ClassName } catch { }
+    if (-not $cls) { try { $cls = [string]$Rule.psbase.SystemProperties['__CLASS'].Value } catch { } }
+    if ($cls) { return ($cls -eq 'SMS_CollectionRuleDirect') }
+    return ($null -ne $Rule.PSObject.Properties['ResourceID'] -and $null -ne $Rule.ResourceID)
+}
+
 function Get-CollectionDirectMap {
     # Koleksiyonlarin DIRECT uyelik kurallari: CollectionID -> { Ok; Error; Name; Rids (HashSet[uint32]) }. Koleksiyon basina tek cagri.
     param([string]$SmsProvider, [string]$SiteCode, [string[]]$CollectionIds)
@@ -643,8 +654,7 @@ function Get-CollectionDirectMap {
             $c.Get()   # CollectionRules lazy alan
             foreach ($r in @($c.CollectionRules)) {
                 if (-not $r) { continue }
-                $cls = [string]$r.psbase.ClassPath.ClassName
-                if ($cls -eq 'SMS_CollectionRuleDirect') { [void]$set.Add([uint32]$r.ResourceID) }
+                if (Test-DirectRule $r) { [void]$set.Add([uint32]$r.ResourceID) }
             }
             $map[$id] = [pscustomobject]@{ Ok = $true; Error = ''; Name = [string]$c.Name; Rids = $set }
         }
@@ -986,7 +996,9 @@ function Invoke-CollectionChange {
         if ([int]$c.CollectionType -ne 2) { throw "Device Collection degil (CollectionType=$($c.CollectionType))" }
         $c.Get()
         $direct = @{}   # ResourceID -> mevcut direct kural nesnesi
-        foreach ($r in @($c.CollectionRules)) { if ($r -and [string]$r.psbase.ClassPath.ClassName -eq 'SMS_CollectionRuleDirect') { $direct[[uint32]$r.ResourceID] = $r.psbase } }
+        foreach ($r in @($c.CollectionRules)) {   # mevcut direct kurallar: ResourceID -> { RuleName; ResourceClassName }
+            if (Test-DirectRule $r) { $direct[[uint32]$r.ResourceID] = [pscustomobject]@{ RuleName = [string]$r.RuleName; ResourceClassName = $(if ($r.ResourceClassName) { [string]$r.ResourceClassName } else { 'SMS_R_System' }) } }
+        }
 
         $todo = New-Object System.Collections.ArrayList   # { Host; Rid; Rule }
         $notDirect = @()
@@ -1021,37 +1033,46 @@ function Invoke-CollectionChange {
             }
             else {
                 $mo = $c.psbase
-                if ($Mode -eq 'Add') {
-                    $rc = New-Object System.Management.ManagementClass ("\\$SmsProvider\$ns" + ':SMS_CollectionRuleDirect')
-                    foreach ($t in $todo) {
-                        $ri = $rc.CreateInstance()
-                        $ri['ResourceClassName'] = 'SMS_R_System'; $ri['ResourceID'] = [uint32]$t.Rid; $ri['RuleName'] = [string]$t.Host
-                        $t | Add-Member -NotePropertyName Rule -NotePropertyValue $ri
-                    }
+                # Ekleme ve cikarma icin YENI SMS_CollectionRuleDirect ornegi (cikarmada mevcut kuralin RuleName / ResourceClassName'i kopyalanir).
+                # Koleksiyondan okunan gomulu kural nesnesi metoda parametre olarak VERILMEZ (WMI tip / parametre hatasi verir).
+                $rc = New-Object System.Management.ManagementClass ("\\$SmsProvider\$ns" + ':SMS_CollectionRuleDirect')
+                foreach ($t in $todo) {
+                    $ri = $rc.CreateInstance()
+                    $ri['ResourceID'] = [uint32]$t.Rid
+                    if ($Mode -eq 'Add') { $ri['ResourceClassName'] = 'SMS_R_System'; $ri['RuleName'] = [string]$t.Host }
+                    else { $ri['ResourceClassName'] = $t.Rule.ResourceClassName; $ri['RuleName'] = $t.Rule.RuleName }
+                    $t | Add-Member -NotePropertyName WmiRule -NotePropertyValue $ri -Force
                 }
                 $one = if ($Mode -eq 'Add') { 'AddMembershipRule' } else { 'DeleteMembershipRule' }
-                $err = @{}
+                $err = @{}; $batchErr = ''
                 try {   # once toplu (tek cagri); olmazsa cihaz basina
                     $in = $mo.GetMethodParameters("${one}s")
-                    $in['collectionRules'] = [System.Management.ManagementBaseObject[]]@($todo | ForEach-Object { $_.Rule })
-                    $null = $mo.InvokeMethod("${one}s", $in, $null)
+                    $in['collectionRules'] = [System.Management.ManagementBaseObject[]]@($todo | ForEach-Object { $_.WmiRule })
+                    $o = $mo.InvokeMethod("${one}s", $in, $null)
+                    if ($o -and $null -ne $o['ReturnValue'] -and [int64]$o['ReturnValue'] -ne 0) { throw "${one}s ReturnValue=$($o['ReturnValue'])" }
                 }
                 catch {
+                    $batchErr = "${one}s: $(Get-ErrText $_.Exception)"
                     foreach ($t in $todo) {
-                        try { $in = $mo.GetMethodParameters($one); $in['collectionRule'] = $t.Rule; $null = $mo.InvokeMethod($one, $in, $null) }
-                        catch { $err[$t.Rid] = $_.Exception.Message }
+                        try {
+                            $in = $mo.GetMethodParameters($one); $in['collectionRule'] = $t.WmiRule
+                            $o = $mo.InvokeMethod($one, $in, $null)
+                            if ($o -and $null -ne $o['ReturnValue'] -and [int64]$o['ReturnValue'] -ne 0) { throw "$one ReturnValue=$($o['ReturnValue'])" }
+                        }
+                        catch { $err[$t.Rid] = "$one`: $(Get-ErrText $_.Exception)" }
                     }
                 }
                 # Dogrulama: kural listesi yeniden okunur
                 $c2 = @(Get-WmiObject -ComputerName $SmsProvider -Namespace $ns -Class SMS_Collection -Filter "CollectionID = '$(ConvertTo-WqlString $CollectionId)'" -ErrorAction Stop)[0]
                 $c2.Get()
                 $now = New-Object 'System.Collections.Generic.HashSet[uint32]'
-                foreach ($r in @($c2.CollectionRules)) { if ($r -and [string]$r.psbase.ClassPath.ClassName -eq 'SMS_CollectionRuleDirect') { [void]$now.Add([uint32]$r.ResourceID) } }
+                foreach ($r in @($c2.CollectionRules)) { if (Test-DirectRule $r) { [void]$now.Add([uint32]$r.ResourceID) } }
                 foreach ($t in $todo) {
                     $ok = if ($Mode -eq 'Add') { $now.Contains([uint32]$t.Rid) } else { -not $now.Contains([uint32]$t.Rid) }
-                    if ($ok) { & $add $t.Host $t.Rid $(if ($Mode -eq 'Add') { 'Eklendi' } else { 'Cikarildi' }) "ResourceID=$($t.Rid)" }
+                    if ($ok) { & $add $t.Host $t.Rid $(if ($Mode -eq 'Add') { 'Eklendi' } else { 'Cikarildi' }) ("ResourceID=$($t.Rid)" + $(if ($batchErr) { " (toplu cagri basarisizdi, cihaz basina yapildi: $batchErr)" } else { '' })) }
                     else {
                         $m = $err[$t.Rid]; if (-not $m) { $m = 'Islem sonrasi kural listesi beklenen durumda degil' }
+                        if ($batchErr) { $m += " | $batchErr" }
                         & $add $t.Host $t.Rid $(if (Test-AccessError $m) { 'Yetki yok' } else { 'Islem hatasi' }) $m
                     }
                 }
@@ -1083,7 +1104,7 @@ function New-WorkerScript {
 }
 $script:ReachFuncs = @('ConvertTo-WqlString', 'Get-ErrText', 'Test-Ping', 'Test-TcpPort', 'Get-NetBiosName', 'Get-WmiFailureReason', 'Get-WmiComputerName',
     'Get-DnsWildcardIps', 'Test-PingOnly', 'Resolve-HostDns', 'Get-HostReach', 'Get-ServiceCheck', 'Get-WmiProp')
-$script:ServerFuncs = @('ConvertTo-WqlString', 'Get-WmiProp', 'ConvertFrom-WmiDate', 'Test-AccessError', 'Get-WmiChunked', 'Get-SccmDeviceMap', 'Get-CollectionDirectMap')
+$script:ServerFuncs = @('ConvertTo-WqlString', 'Get-ErrText', 'Get-WmiProp', 'ConvertFrom-WmiDate', 'Test-AccessError', 'Get-WmiChunked', 'Get-SccmDeviceMap', 'Test-DirectRule', 'Get-CollectionDirectMap')
 $script:TsClientFuncs = @('Invoke-StdReg', 'Get-RegValues', 'Get-TsClientState', 'Get-OsBuildLive', 'ConvertFrom-WmiDate', 'Get-TsAdvIds', 'Get-TsResourceId', 'Get-TsStepInfo')
 
 $script:CheckWorker    = New-WorkerScript '$ComputerName, $PackageId, $SmsProvider, $SiteCode, $DeploymentId' 'Get-TsHostCheck -ComputerName $ComputerName -PackageId $PackageId -SmsProvider $SmsProvider -SiteCode $SiteCode -DeploymentId $DeploymentId' ($script:ReachFuncs + $script:TsClientFuncs + 'Get-TsHostCheck')
@@ -1655,7 +1676,8 @@ function Update-FromCollection {
     Write-ActionLog -Hostname '-' -Action "$verb [$($op.Id) $($op.Short)] OZET" -State $(if ($r.Ok) { 'ok' } else { 'fail' }) -Text $sum
     $lblStatus.ForeColor = $(if ($r.Ok) { [System.Drawing.Color]::DarkGreen } else { [System.Drawing.Color]::Firebrick })
     $lblStatus.Text = "${verb} tamamlandi. $sum"
-    $script:ShowAfterRun = [pscustomobject]@{ Title = $verb; Text = "$sum$(if ($r.Error) { "`r`n`r`nHata: $($r.Error)" })"; Box = $true }
+    $errs = @($r.Results | Where-Object { $_.Code -in 'Yetki yok', 'Islem hatasi' } | ForEach-Object { "$($_.Host): $($_.Detail)" } | Select-Object -First 3)
+    $script:ShowAfterRun = [pscustomobject]@{ Title = $verb; Text = "$sum$(if ($r.Error) { "`r`n`r`nHata: $($r.Error)" })$(if ($errs.Count) { "`r`n`r`nIlk hatalar (tamami: satira cift tik):`r`n" + ($errs -join "`r`n") })"; Box = $true }
 }
 #endregion
 
