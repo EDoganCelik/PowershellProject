@@ -1065,6 +1065,35 @@ function Get-ShortReason {
     return 'Islem hatasi'
 }
 
+function Get-ShortDns {
+    # DNS kolonu (Panel 1 + 2): IP listesi / joker cevap / hata metni yerine SABIT ifade. Uzun hali detayda.
+    param([string]$Value)
+    if (-not $Value -or $Value -eq $script:PendingText -or $Value -eq 'Iptal edildi' -or $Value -eq 'Alinamadi') { return $Value }
+    if ($Value -match 'No such host') { return 'No such host is known' }
+    if ($Value -like 'DNS hatasi*')   { return 'DNS hatasi' }
+    if ($Value -like 'Islem hatasi*') { return 'Islem hatasi' }
+    return 'Cozumlendi'
+}
+
+function Get-ShortOnline {
+    # Online kolonu (Panel 1 + 2): IP / cihaz adi olmadan SABIT ifade. Uzun hali detayda.
+    param([string]$Value)
+    if ($Value -like 'Hayir (IP baska cihazda*') { return 'Hayir (IP baska cihazda)' }
+    if ($Value -like 'Hayir (ping var*')        { return 'Hayir (dogrulanamadi)' }
+    if ($Value -like 'Hayir*')                  { return 'Hayir' }
+    return $Value
+}
+
+function Get-ShortActionResult {
+    # Istemci eylemi sonucu (Panel 1 Islem Sonucu / Panel 2 CcmExec_Durumu "Onarim:"): SABIT kisa ifade.
+    # Basarisizsa Get-ShortReason; basariliysa aciklama kismi atilir ("Onarim baslatildi - ccmrepair ..." -> "Onarim baslatildi").
+    param([string]$Result, [string]$State)
+    $t = ($Result -replace '\s+', ' ').Trim()
+    if ($State -eq 'fail' -or $t -like 'Islem hatasi*' -or $t -eq 'Iptal edildi') { return (Get-ShortReason -Text $t) }
+    $t = $t -replace '\s*\(cihaz kimligi dogrulanamadi\)', ''
+    return (($t -split ' - ')[0]).Trim()
+}
+
 function Resolve-PendingCells {
     # Islem hata verdigi / iptal edildigi icin hala 'Bekleniyor..' kalan hucreleri doldurur.
     param([string]$Hostname, [string]$ErrorText = '')
@@ -1176,11 +1205,11 @@ function Receive-ScriptSend {
         Start = $r.SentAt; TimeoutSec = $r.TimeoutSec; Deadline = $r.SentAt.AddSeconds($r.TimeoutSec)
     })
     # Kontrol sonuclari (DNS / AD / servis) script sonucu beklenmeden tabloya yazilir
-    $wait = "Gonderildi - sonuc bekleniyor (en fazla $($r.TimeoutSec) sn)"
+    $wait = 'Gonderildi - sonuc bekleniyor'
     if ($FinalFn -eq 'Update-ParserFromScript') { Set-ParserCheckValues -HostName $Key -Values (ConvertTo-ParserCheckValues -Check $r.Check) }
     else {
         Set-GridValues -Hostname $Key -Values @{
-            DnsStatus = $r.DnsStatus; IsOnline = $r.OnlineText; AdStatus = $r.AdStatus; LastLogon = $r.LastLogon
+            DnsStatus = (Get-ShortDns $r.DnsStatus); IsOnline = (Get-ShortOnline $r.OnlineText); AdStatus = $r.AdStatus; LastLogon = $r.LastLogon
             Running = $r.Running; NotRunning = $r.NotRunning; CcmExec = $r.CcmExec; ActionResult = $wait
         }
     }
@@ -1384,8 +1413,8 @@ function Update-GridFromCheck {
     # State 'fail' = DNS cozumlenemedi / ping yok -> servis bilgisi alinamadi (ulasilamadi)
     $un = ($r.State -eq 'fail')
     Set-GridValues -Hostname $r.Hostname -Values @{
-        DnsStatus    = $r.DnsStatus
-        IsOnline     = $r.OnlineText
+        DnsStatus    = (Get-ShortDns $r.DnsStatus)
+        IsOnline     = (Get-ShortOnline $r.OnlineText)
         AdStatus     = $r.AdStatus
         LastLogon    = $r.LastLogon
         Running      = $(if ($un) { 'Ulasilamadi' } else { $r.Running })
@@ -1417,8 +1446,10 @@ function Update-GridFromFix {
     param($Key, $Output, $ErrorText)
     $f = ConvertFrom-FixRows $Output
     if (-not $f) {
-        Set-GridValues -Hostname $Key -Values @{ LastAction = 'Servis baslat'; ActionResult = (Format-JobError $ErrorText); State = 'fail' }
-        Add-FixReport -Hostname $Key -Status (Format-JobError $ErrorText)
+        $msg = (Format-JobError $ErrorText)
+        Set-GridValues -Hostname $Key -Values @{ LastAction = 'Servis baslat'; ActionResult = (Get-ShortReason -Text $msg); State = 'fail' }
+        Add-RowDetail -Hostname $Key -Text "Servis baslatma: $msg"
+        Add-FixReport -Hostname $Key -Status $msg
         return
     }
     Add-FixReport -Hostname $Key -Status $f.Summary -Fix $f
@@ -1426,9 +1457,10 @@ function Update-GridFromFix {
     if ($e) { $e.ServiceDetail = $f.ServiceDetail }
     Set-GridValues -Hostname $Key -Values @{
         Running = $f.Running; NotRunning = $f.NotRunning; State = $f.State
-        LastAction = "Servis baslat ($(Get-Date -Format 'HH:mm:ss'))"; ActionResult = $f.Summary
+        LastAction = 'Servis baslat'
+        ActionResult = $(if ($f.Summary -match 'kaldi|bulunamadi|erisilemedi') { 'Bazi servisler baslatilamadi' } elseif ($f.Summary -like 'Tum servisler*') { 'Tum servisler calisiyor' } else { 'Servisler baslatildi' })
     }
-    Add-RowDetail -Hostname $Key -Text $f.Detail
+    Add-RowDetail -Hostname $Key -Text "$($f.Detail)`r`nOzet: $($f.Summary)"
     Write-ActionLog -Hostname $Key -Action 'Servis baslat' -State $f.State -Text $f.Summary
 }
 
@@ -1439,10 +1471,9 @@ function Update-GridFromAction {
     if (-not $r -or -not $r.PSObject.Properties['Action']) {
         $r = [pscustomobject]@{ Hostname = $Key; Action = 'Islem'; State = 'fail'; Result = (Format-JobError $ErrorText); Detail = '' }
     }
-    $one = ("$($r.Result)" -replace '\s+', ' ').Trim()
     Set-GridValues -Hostname $r.Hostname -Values @{
-        LastAction   = "$($r.Action) ($(Get-Date -Format 'HH:mm:ss'))"
-        ActionResult = $one
+        LastAction   = [string]$r.Action
+        ActionResult = (Get-ShortActionResult -Result $r.Result -State $r.State)
         State        = $r.State
     }
     $d = "$($r.Action): $($r.Result)"
@@ -1460,7 +1491,7 @@ function Update-GridFromScript {
     if (-not $r) {
         $msg = (Format-JobError $ErrorText)
         Resolve-PendingCells -Hostname $Key -ErrorText $ErrorText
-        Set-GridValues -Hostname $Key -Values @{ LastAction = "Script ($(Get-Date -Format 'HH:mm:ss'))"; ActionResult = $msg; State = 'fail' }
+        Set-GridValues -Hostname $Key -Values @{ LastAction = 'Script'; ActionResult = (Get-ShortReason -Text $msg); State = 'fail' }
         Add-RowDetail -Hostname $Key -Text "Script: $msg"
         Write-ActionLog -Hostname $Key -Action 'Script' -State 'fail' -Text $msg
         return
@@ -1479,15 +1510,15 @@ function Update-GridFromScript {
     $un = (-not $r.IsOnline)
 
     Set-GridValues -Hostname $r.Hostname -Values @{
-        DnsStatus    = $r.DnsStatus
-        IsOnline     = $r.OnlineText
+        DnsStatus    = (Get-ShortDns $r.DnsStatus)
+        IsOnline     = (Get-ShortOnline $r.OnlineText)
         AdStatus     = $r.AdStatus
         LastLogon    = $r.LastLogon
         Running      = $(if ($un -and -not $r.Running) { 'Ulasilamadi' } else { $r.Running })
         NotRunning   = $(if ($un -and -not $r.NotRunning) { 'Ulasilamadi' } else { $r.NotRunning })
         CcmExec      = $(if ($un -and -not $r.CcmExec) { 'Ulasilamadi' } else { $r.CcmExec })
-        LastAction   = "$($r.Action) ($(Get-Date -Format 'HH:mm:ss'))"
-        ActionResult = ("$($r.Result)" -replace '\s+', ' ').Trim()
+        LastAction   = [string]$r.Action
+        ActionResult = $(if ($r.Output) { ("$($r.Result)" -replace '\s+', ' ').Trim() } elseif ("$($r.Result)" -like 'Script calisti*') { 'Script calisti, cikti bos' } else { Get-ShortReason -Text (("$($r.Result)" -replace '\s+', ' ').Trim()) -Context @($r.DnsStatus, $r.OnlineText) })
         ErrorMessage = (Get-ShortReason -Text ($notes -join ' | ') -Context @($r.DnsStatus, $r.OnlineText))
         State        = $state
     }
@@ -1514,19 +1545,19 @@ function Update-GridFromAd {
     if (-not $r) {
         $msg = (Format-JobError $ErrorText)
         Resolve-PendingCells -Hostname $Key -ErrorText $ErrorText
-        Set-GridValues -Hostname $Key -Values @{ LastAction = "AD yapisi kontrolu ($(Get-Date -Format 'HH:mm:ss'))"; ActionResult = $msg; State = 'fail' }
+        Set-GridValues -Hostname $Key -Values @{ LastAction = 'AD yapisi kontrolu'; ActionResult = (Get-ShortReason -Text $msg); State = 'fail' }
         Add-RowDetail -Hostname $Key -Text "AD yapisi kontrolu: $msg"
         return
     }
 
     $summary = "AD: $($r.AdStatus); Last Logon: $($r.LastLogon)"
     Set-GridValues -Hostname $r.Hostname -Values @{
-        DnsStatus    = $r.DnsStatus
-        IsOnline     = $r.OnlineText
+        DnsStatus    = (Get-ShortDns $r.DnsStatus)
+        IsOnline     = (Get-ShortOnline $r.OnlineText)
         AdStatus     = $r.AdStatus
         LastLogon    = $r.LastLogon
-        LastAction   = "AD yapisi kontrolu ($(Get-Date -Format 'HH:mm:ss'))"
-        ActionResult = $summary
+        LastAction   = 'AD yapisi kontrolu'
+        ActionResult = "AD: $($r.AdStatus)"
         ErrorMessage = (Get-ShortReason -Text $r.ErrorMessage -Context @($r.DnsStatus, $r.OnlineText))
         State        = $r.State
     }
@@ -2124,14 +2155,14 @@ function Set-ParserCheckValues {
 function ConvertTo-ParserCheckValues {
     param($Check)
     return @{
-        DNS_Durumu     = [string]$Check.DnsStatus
-        Online_mi      = [string]$Check.OnlineText
+        DNS_Durumu     = (Get-ShortDns ([string]$Check.DnsStatus))
+        Online_mi      = (Get-ShortOnline ([string]$Check.OnlineText))
         AD_Durumu      = [string]$Check.AdStatus
         AD_LastLogon   = [string]$Check.LastLogon
         Calisan_Servisler    = [string]$Check.Running
         Calismayan_Servisler = [string]$Check.NotRunning
         CcmExec_Durumu = [string]$Check.CcmExec
-        SCCM_Kayit     = [string]$Check.SccmKayit
+        SCCM_Kayit     = $(if ([string]$Check.SccmKayit -like 'Sorgulanamadi:*') { 'Sorgulanamadi' } else { [string]$Check.SccmKayit })
     }
 }
 
@@ -2158,7 +2189,7 @@ function Update-ParserFromCheck {
     Set-AdInfo $c -NoteProp 'Note'   # AD kolonlari: $AdData
     if (-not $c) {
         $msg = (Format-JobError $ErrorText)
-        $v = @{}; foreach ($cn in $script:ParserCheckColumns) { $v[$cn] = '' }; $v['DNS_Durumu'] = $msg
+        $v = @{}; foreach ($cn in $script:ParserCheckColumns) { $v[$cn] = '' }; $v['DNS_Durumu'] = (Get-ShortReason -Text $msg)
         Set-ParserCheckValues -HostName $Key -Values $v
         Add-ParserDetail -Hostname $Key -Text "Kontrol: $msg"
         return
@@ -2224,7 +2255,7 @@ function Update-ParserFromFix {
     $f = ConvertFrom-FixRows $Output
     if (-not $f) {
         $msg = Format-JobError $ErrorText
-        Set-ParserCheckValues -HostName $Key -Values @{ Calismayan_Servisler = "Servis baslatma: $msg" }
+        Set-ParserCheckValues -HostName $Key -Values @{ Calismayan_Servisler = "Servis baslatma: $(Get-ShortReason -Text $msg)" }
         Add-ParserDetail -Hostname $Key -Text "Servis baslatma: $msg"
         Write-ActionLog -Hostname $Key -Action 'Servis baslat (Parser)' -State 'fail' -Text $msg
         Add-FixReport -Hostname $Key -Status $msg
@@ -2837,8 +2868,7 @@ function Update-ParserFromAction {
     param($Key, $Output, $ErrorText)
     $r = @($Output | Where-Object { $_ -and $_.PSObject.Properties['Action'] })[0]
     if (-not $r) { $r = [pscustomobject]@{ Hostname = $Key; Action = 'Istemci onarimi'; State = 'fail'; Result = (Format-JobError $ErrorText); Detail = '' } }
-    $one = ("$($r.Result)" -replace '\s+', ' ').Trim()
-    Set-ParserCheckValues -HostName $Key -Values @{ CcmExec_Durumu = "Onarim: $one" }
+    Set-ParserCheckValues -HostName $Key -Values @{ CcmExec_Durumu = "Onarim: $(Get-ShortActionResult -Result $r.Result -State $r.State)" }
     Add-ParserDetail -Hostname $Key -Text ("$($r.Action): $($r.Result)" + $(if ($r.Detail) { "`r`n$($r.Detail)" } else { '' }))
     Write-ActionLog -Hostname $Key -Action "$($r.Action) (Parser)" -State $r.State -Text $r.Result
 }
