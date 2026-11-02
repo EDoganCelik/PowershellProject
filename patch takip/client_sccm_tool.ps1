@@ -1049,6 +1049,7 @@ function Get-ShortReason {
     if ($parts.Count -eq 0) { return '' }
     $all = (@($parts) + @($Context | Where-Object { $_ })) -join ' | '
     $map = @(
+        @('^Script calisti',                                                                    'Cikti bos'),   # script calisti ama cikti bos/null: hata DEGIL
         @('No such host',                                                                       'No such host is known'),
         @('IP baska cihazda|baska cihazdan geliyor',                                            'IP baska cihazda'),
         @('kimlik dogrulanamadi|kimligi dogrulanamadi|cihaz dogrulanamadi|makine oldugu dogrulanamadi|Kerberos', 'Kimlik dogrulanamadi'),
@@ -1518,7 +1519,7 @@ function Update-GridFromScript {
         NotRunning   = $(if ($un -and -not $r.NotRunning) { 'Ulasilamadi' } else { $r.NotRunning })
         CcmExec      = $(if ($un -and -not $r.CcmExec) { 'Ulasilamadi' } else { $r.CcmExec })
         LastAction   = [string]$r.Action
-        ActionResult = $(if ($r.Output) { ("$($r.Result)" -replace '\s+', ' ').Trim() } elseif ("$($r.Result)" -like 'Script calisti*') { 'Script calisti, cikti bos' } else { Get-ShortReason -Text (("$($r.Result)" -replace '\s+', ' ').Trim()) -Context @($r.DnsStatus, $r.OnlineText) })
+        ActionResult = $(if ($r.Output) { ("$($r.Result)" -replace '\s+', ' ').Trim() } elseif ("$($r.Result)" -like 'Script calisti*') { 'Cikti bos' } else { Get-ShortReason -Text (("$($r.Result)" -replace '\s+', ' ').Trim()) -Context @($r.DnsStatus, $r.OnlineText) })
         ErrorMessage = (Get-ShortReason -Text ($notes -join ' | ') -Context @($r.DnsStatus, $r.OnlineText))
         State        = $state
     }
