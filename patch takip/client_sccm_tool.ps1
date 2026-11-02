@@ -1036,6 +1036,35 @@ function Format-JobError {
     return "Islem hatasi: $ErrorText"
 }
 
+function Get-ShortReason {
+    # SADECE ANA PENCERE (New-WorkerScript listesine EKLENMEZ). Uzun / degisken hata metnini Excel'de filtrelenebilir
+    # SABIT bir ifadeye cevirir. Uzun metin degismeden detaya (Add-RowDetail / Add-ParserDetail) yazilmaya devam eder.
+    # -Text   : asil metin (' | ' ile birlesik notlar olabilir). Bilgi amacli notlar (AD verisi.. / Sadece ping listesinde..
+    #           / Script exit code..) diger kolonlarda zaten gorundugu icin atlanir; geriye bir sey kalmazsa '' doner.
+    # -Context: sadece eslesmeye katilan ek metin (DNS / Online kolonu); tek basina sonuc URETMEZ.
+    # SIRA ONEMLI: yukaridan asagiya ilk eslesen kazanir (-match, buyuk/kucuk harf duyarsiz).
+    param([string]$Text, [string[]]$Context = @())
+    $parts = @(([string]$Text -split '\s+\|\s+') | ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and $_ -notmatch '^(AD verisi|Sadece ping listesinde|Script exit code)' })
+    if ($parts.Count -eq 0) { return '' }
+    $all = (@($parts) + @($Context | Where-Object { $_ })) -join ' | '
+    $map = @(
+        @('No such host',                                                                       'No such host is known'),
+        @('IP baska cihazda|baska cihazdan geliyor',                                            'IP baska cihazda'),
+        @('kimlik dogrulanamadi|kimligi dogrulanamadi|cihaz dogrulanamadi|makine oldugu dogrulanamadi|Kerberos', 'Kimlik dogrulanamadi'),
+        @('CcmExec servisi yok',                                                                'CcmExec servisi yok'),
+        @('SCCM ajani bulunmuyor|root\\ccm|namespace',                                          'SCCM ajani yok'),
+        @('CcmExec servisi',                                                                    'CcmExec calismiyor'),
+        @('RPC sunucusu|RPC server',                                                            'RPC erisilemiyor'),
+        @('Erisim engellendi|Access is denied|Access denied',                                   'Erisim engellendi'),
+        @('yanit gelmedi|zaman asimi|timed out|timeout',                                        'Script yanit vermedi'),
+        @('Iptal edildi',                                                                       'Iptal edildi'),
+        @('Cevrimdisi|ping basarisiz|DNS cozumlenemedi',                                        'Cevrimdisi')
+    )
+    foreach ($m in $map) { if ($all -match $m[0]) { return $m[1] } }
+    return 'Islem hatasi'
+}
+
 function Resolve-PendingCells {
     # Islem hata verdigi / iptal edildigi icin hala 'Bekleniyor..' kalan hucreleri doldurur.
     param([string]$Hostname, [string]$ErrorText = '')
@@ -1345,8 +1374,10 @@ function Update-GridFromCheck {
     $r = @($Output)[0]
     Set-AdInfo $r
     if (-not $r -or -not $r.PSObject.Properties['DnsStatus']) {
+        $msg = (Format-JobError $ErrorText)
         Resolve-PendingCells -Hostname $Key -ErrorText $ErrorText
-        Set-GridValues -Hostname $Key -Values @{ ErrorMessage = (Format-JobError $ErrorText); State = 'fail' }
+        Set-GridValues -Hostname $Key -Values @{ ErrorMessage = (Get-ShortReason -Text $msg); State = 'fail' }
+        Add-RowDetail -Hostname $Key -Text "Kontrol: $msg"
         return
     }
     $script:LastResults[$r.Hostname] = $r
@@ -1360,7 +1391,7 @@ function Update-GridFromCheck {
         Running      = $(if ($un) { 'Ulasilamadi' } else { $r.Running })
         NotRunning   = $(if ($un) { 'Ulasilamadi' } else { $r.NotRunning })
         CcmExec      = $(if ($un) { 'Ulasilamadi' } else { $r.CcmExec })
-        ErrorMessage = $r.ErrorMessage
+        ErrorMessage = (Get-ShortReason -Text $r.ErrorMessage -Context @($r.DnsStatus, $r.OnlineText))
         State        = $r.State
     }
     Add-RowDetail -Hostname $r.Hostname -Text ("Kontrol: DNS=$($r.DnsStatus); Online=$($r.OnlineText); AD=$($r.AdStatus); LastLogon=$($r.LastLogon); CcmExec=$($r.CcmExec)" + $(if ($r.ErrorMessage) { "`r`nNot: $($r.ErrorMessage)" } else { '' }))
@@ -1457,7 +1488,7 @@ function Update-GridFromScript {
         CcmExec      = $(if ($un -and -not $r.CcmExec) { 'Ulasilamadi' } else { $r.CcmExec })
         LastAction   = "$($r.Action) ($(Get-Date -Format 'HH:mm:ss'))"
         ActionResult = ("$($r.Result)" -replace '\s+', ' ').Trim()
-        ErrorMessage = ($notes -join ' | ')
+        ErrorMessage = (Get-ShortReason -Text ($notes -join ' | ') -Context @($r.DnsStatus, $r.OnlineText))
         State        = $state
     }
 
@@ -1468,6 +1499,7 @@ function Update-GridFromScript {
     if (@($r.ServiceDetail).Count -gt 0) {
         $d += "`r`nServisler: " + ((@($r.ServiceDetail) | ForEach-Object { "$($_.Name)=$($_.Status)" }) -join ', ')
     }
+    if ($notes.Count -gt 0) { $d += "`r`nNot: $($notes -join ' | ')" }   # grid'de kisa ifade var; uzun not detayda kalsin
     if ($r.Detail) { $d += "`r`n$($r.Detail)" }
     Add-RowDetail -Hostname $r.Hostname -Text $d
     Write-ActionLog -Hostname $r.Hostname -Action $r.Action -State $state -Text $r.Result
@@ -1495,7 +1527,7 @@ function Update-GridFromAd {
         LastLogon    = $r.LastLogon
         LastAction   = "AD yapisi kontrolu ($(Get-Date -Format 'HH:mm:ss'))"
         ActionResult = $summary
-        ErrorMessage = $r.ErrorMessage
+        ErrorMessage = (Get-ShortReason -Text $r.ErrorMessage -Context @($r.DnsStatus, $r.OnlineText))
         State        = $r.State
     }
     Add-RowDetail -Hostname $r.Hostname -Text ("AD yapisi kontrolu: DNS=$($r.DnsStatus); Online=$($r.OnlineText); AD=$($r.AdStatus); LastLogon=$($r.LastLogon)" + $(if ($r.ErrorMessage) { "`r`nNot: $($r.ErrorMessage)" } else { '' }))
@@ -2149,7 +2181,7 @@ function Update-ParserFromScript {
     if (-not $r) {
         $msg = (Format-JobError $ErrorText)
         $r0 = Add-ParserLines -SourceHost $Key -Text ''
-        Add-ParserInfoRow -SourceHost $Key -Hostname $Key -Message $msg -At $r0.Pos
+        Add-ParserInfoRow -SourceHost $Key -Hostname $Key -Message (Get-ShortReason -Text $msg) -At $r0.Pos
         $script:ParserNoOutput[$Key] = $true
         Add-ParserDetail -Hostname $Key -Text "Script (Parser): $msg"
         Write-ActionLog -Hostname $Key -Action 'Script (Parser)' -State 'fail' -Text $msg
@@ -2160,8 +2192,8 @@ function Update-ParserFromScript {
     $chk = $r.Check
     $res = Add-ParserLines -SourceHost $hn -Text ([string]$r.Output)
     if ($res.Added -eq 0) {
-        $one = ("$($r.Result)" -replace '\s+', ' ').Trim()
-        Add-ParserInfoRow -SourceHost $hn -Hostname $hn -Message $one -At $res.Pos
+        $one = Get-ShortReason -Text (("$($r.Result)" -replace '\s+', ' ').Trim()) -Context @($chk.DnsStatus, $chk.OnlineText)
+        Add-ParserInfoRow -SourceHost $hn -Hostname $hn -Message $(if ($one) { $one } else { 'Islem hatasi' }) -At $res.Pos
         $script:ParserNoOutput[$hn] = $true
     }
     else {
